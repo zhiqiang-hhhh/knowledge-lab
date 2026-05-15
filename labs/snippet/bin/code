@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+
+set -u
+
+max_retry=10
+
+run_local_code() {
+    local local_code=""
+
+    if [[ -n "${VSCODE_CLI_PATH:-}" && -x "${VSCODE_CLI_PATH}" ]]; then
+        "${VSCODE_CLI_PATH}" "$@"
+        return "$?"
+    fi
+
+    for local_code in \
+        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+        "/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code" \
+        "$HOME/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+        "$HOME/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code"; do
+        if [[ -x "$local_code" ]]; then
+            "$local_code" "$@"
+            return "$?"
+        fi
+    done
+
+    if command -v open >/dev/null 2>&1; then
+        open -b com.microsoft.VSCode "$@" >/dev/null 2>&1 && return 0
+        open -b com.microsoft.VSCodeInsiders "$@" >/dev/null 2>&1 && return 0
+    fi
+
+    return 1
+}
+
+get_remote_script() {
+    local idx="$1"
+    local script=""
+
+    script=$(ls -td "$HOME/.vscode-server/cli/servers/"*/server/bin/remote-cli/code 2>/dev/null | sed -n "${idx}p")
+    [[ -n "$script" ]] && echo "$script" && return 0
+
+    script=$(ls -td "$HOME/.vscode-server/bin/"*/bin/remote-cli/code 2>/dev/null | sed -n "${idx}p")
+    [[ -n "$script" ]] && echo "$script" && return 0
+
+    return 1
+}
+
+get_remote_socket() {
+    local idx="$1"
+    local socket=""
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        socket=$(ls -t "${TMPDIR%/}"/vscode-ipc-* /tmp/vscode-ipc-* 2>/dev/null | sed -n "${idx}p")
+    else
+        socket=$(ls -t "/run/user/$UID"/vscode-ipc-* "${XDG_RUNTIME_DIR:-/run/user/$UID}"/vscode-ipc-* 2>/dev/null | sed -n "${idx}p")
+    fi
+
+    [[ -n "$socket" ]] && echo "$socket"
+}
+
+run_remote_code() {
+    local i script socket
+
+    for i in $(seq 1 "$max_retry"); do
+        script="$(get_remote_script "$i")"
+        [[ -z "$script" ]] && continue
+
+        socket="$(get_remote_socket "$i")"
+        [[ -z "$socket" ]] && continue
+
+        export VSCODE_IPC_HOOK_CLI="$socket"
+        "$script" "$@" 2>/dev/null && return 0
+    done
+
+    return 1
+}
+
+# Default: local development only. Set CODE_USE_REMOTE=1 to force remote-cli flow.
+if [[ "${CODE_USE_REMOTE:-0}" != "1" ]]; then
+    run_local_code "$@" && exit 0
+    echo "Local VS Code CLI not found. Install VS Code and run 'Shell Command: Install code command in PATH', or set VSCODE_CLI_PATH."
+    exit 1
+fi
+
+run_remote_code "$@" && exit 0
+echo "VS Code remote-cli not available. Unset CODE_USE_REMOTE for local mode."
+exit 1

@@ -1,0 +1,86 @@
+---
+layout: post
+title:  "[C++] Extern C"
+date:   2021-07-03 19:28:11 +0800
+categories: jekyll update
+---
+
+# 关键字 Extren C
+## 现象
+库文件的定义是 Cpp 文件，使用 g++ 编译
+```c++
+// foo.h
+void foo();
+
+// foo.cpp
+#include "foo.h"
+
+void foo(){}
+```
+```bash
+g++ -c -o foo.o -O0 -ggdb foo.cpp
+```
+main.c 使用 gcc 编译
+
+```c++
+// main.c
+#include "foo.h"
+
+int main(){
+    foo();
+}
+```
+```bash
+gcc -c -o main.o -O0 -ggdb main.c
+```
+
+链接`gcc main.o foo.o -o foo_app`，报错：
+```bash
+Undefined symbols for architecture x86_64:
+  "_foo", referenced from:
+      _main in main.o
+ld: symbol(s) not found for architecture x86_64
+collect2: error: ld returned 1 exit status
+```
+
+添加`Extern "C"`之后：
+```c++
+// foo.h
+#ifdef __cplusplus
+extern "C"{
+#endif
+
+    void foo();
+
+#ifdef __cplusplus
+};
+#endif
+
+// foo.cpp
+#include "foo.h"
+
+extern "C" {
+    void foo(){}
+};
+```
+按照 C 语言规则编译生成`foo.o`可以被正常链接：
+```bash
+g++ -c -o foo.o -O0 -ggdb foo.cpp
+gcc main.o foo.o -o foo_app
+```
+
+## 解释
+由于 Cpp 支持函数重载，因此 Cpp 编译器在遇到函数名时，会按照一定的规则，在编译时对函数名重命名，相同函数名不同函数参数的函数会具有不一样的新名字。
+
+而 C 语言不支持函数重载，因此 C 编译器编译 C 代码时采用与 Cpp 编译器不一样的重命名规则。
+
+比如这里 main.c 中的 foo 就被重命名为 _foo，而 foo.cpp 中的则被 g++ 重命名为另一个名字。
+
+这就导致 main.o 链接 foo.o 时发现 _foo 是一个未被定义的符号。
+
+添加 Extern "C" 作用就是告诉编译器，对于本段代码，要按照 C 语言规则去生成函数名。这样确保生成的 foo.o 能够被引用了 foo.h 的 C 语言代码链接。
+
+foo.h 文件比较特殊，它既会被 Cpp 编译器处理，也因为被 main.c 包含而被 C 语言编译器处理，因此不能直接在 foo.h 中添加`Extern "C"`，需要通过`__cplusplus`——这个只会被 Cpp 编译器定义的宏——来确保编译正确。
+
+## 总结
+`Extern "C"`的典型使用场景是，当我们用 Cpp 编译器编译 Cpp 代码，生成一个库文件，这个库文件未来会被 C 语言代码链接时，我们需要使用它。

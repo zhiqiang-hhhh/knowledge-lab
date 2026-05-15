@@ -1,0 +1,10 @@
+#!/bin/bash
+
+GRAFANA_DIR="/mnt/disk6/common/grafana-v11.5.1"
+GRAFANA_LOG="/tmp/grafana.log"
+
+cd "$GRAFANA_DIR" || exit 1
+
+echo "Starting Grafana..."
+nohup sudo ./bin/grafana server > "$GRAFANA_LOG" 2>&1 &
+echo "Grafana started with PID $!"

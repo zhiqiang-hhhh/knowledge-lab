@@ -1,0 +1,20 @@
+version: 1.0.0
+metadata:
+  createdAt: '2025-11-11T02:41:04.360Z'
+  modifiedAt: '2025-11-11T02:41:35.457Z'
+project:
+  id: 573176dd-3749-432f-a128-3ea29d9cc206
+  name: vecml-testing
+  notebooks:
+    - blocks:
+        - blockGroup: 3365ead0-0bff-43c9-b357-353034071228
+          content: 'from '
+          id: c413acfc-0a92-4e63-9ba6-91c7846d4b90
+          metadata: {}
+          sortingKey: '0'
+          type: code
+          executionCount: 0
+          outputs: []
+      executionMode: block
+      id: f662218d-fdd4-4642-8e12-6440a4b53017
+      name: Notebook 1

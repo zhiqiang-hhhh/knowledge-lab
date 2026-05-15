@@ -1,0 +1,15 @@
+[submodule "contrib/faiss"]
+	path = contrib/faiss
+	url = https://github.com/zhiqiang-hhhh/doris-thirdparty.git
+	branch = faiss
+[submodule "contrib/openblas"]
+	path = contrib/openblas
+	url = https://github.com/zhiqiang-hhhh/doris-thirdparty.git
+	branch = openblas
+[submodule "openssl"]
+	path = contrib/openssl
+	url = https://github.com/openssl/openssl.git
+[submodule "contrib/diskann"]
+	path = contrib/diskann
+	url = git@github.com:zhiqiang-hhhh/DiskANN.git
+	branch = cpp_main

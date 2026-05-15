@@ -1,0 +1,241 @@
+---
+layout: post
+title:  "程序的机器级表示【2】"
+date:   2020-12-22 16:00:03 +0800
+categories: jekyll update
+---
+
+
+
+在前一章中，通过简单的 demo，我们初步了解了 x86-64 下寄存器的表示方式，指令操作数如何寻址，学习了 mov 指令的最基础使用。本章我们将继续学习数据传送类指令。
+
+## 强制类型转换 demo
+我们依然从一段 C 源代码开始，这段代码的作用是进行变量的强制类型转换，将一个 4 字节的 int 类型转换为一个 8 字节的 long 类型。
+```c
+int change(int *x, long* y){
+    long r = *y;
+    *y = (long)*x;
+    return r;
+}
+```
+`gcc -Og -S change.c`得到精简后的汇编代码如下：
+```asm
+change:
+	movq	(%rsi), %rax
+	movslq	(%rdi), %rdx
+	movq	%rdx, (%rsi)
+	ret
+```
+根据[程序的机器级表示【1】](https://roanhe-ts.github.io/jekyll/update/2020/12/21/%E7%A8%8B%E5%BA%8F%E7%9A%84%E6%9C%BA%E5%99%A8%E7%BA%A7%E8%A1%A8%E7%A4%BA-1.html)中已经讲过的内容，我们可以很容易看懂：
+
+`movq (%rsi), %rax`访问内存中的 4 字（8 字节）数据，将数据复制到寄存器 rax 中，内存的开始位置保存在寄存器 rsi 中，并且之前提到，rax 可以用作保存函数返回值，所以这段汇编对应的 C 代码应该是`long r = *y;`
+
+既然寄存器 rsi 保存的是函数入参 y，那么第三行汇编`movq %rdx, (%rsi)`作用就是给指针变量 y 指向的内存赋一个四字节数据，`movslq (%rdi), %rdx`作用应该是将指针变量 x 指向的内存数据拷贝到寄存器 rdx 中，第二行第三行汇编一起完成了 C 代码：`*y = (long)*x;`。
+
+OK，到这里相信大家肯定可以猜到，`movslq`指令就是完成强制类型转换的关键指令。
+
+## 整数的强制类型转换
+在更仔细介绍`movslq`指令之前，先复习一下整数之间的类型转换。
+
+对于整数，主要有两种编码方式，一种适用于无符号数，一种适用于有符号数。前者使用最简单的二进制编码，后者使用补码编码。
+对于实数，则使用 IEEE754 标准。我们这里谈到的强制类型转换只涉及整数之间的转换。
+
+### 无符号与有符号数
+当我们谈到无符号数与有符号数之间的转换时，默认两数的位长相同。C 语言对二进制编码到补码编码之间的转换使用的原则是：**位值不变，改变解释位值的方式。**
+比如如下代码：
+```c
+#include <stdio.h>
+
+void print_bytes(void* p, size_t s)
+{
+    unsigned char* ucp = (unsigned char*)p;
+    for(size_t i=0; i<s; ++i){
+        printf(" %.2x", *(ucp+i));
+    }
+
+    printf("\n");
+}
+
+int main(){
+    int i = 0xF000FFFF;
+    unsigned u = (unsigned)i;
+
+    printf("i: %d\n", i);
+    print_bytes((void *) &i, sizeof(int));
+    printf("u: %u\n", u);
+    print_bytes((void *) &u, sizeof(unsigned));
+    return 0;
+}
+```
+进行 4 字节的 int 到 4 字节 unsigned 的转换，并且打印出了位值。
+在采用小端表示法的机器上运行后的结果如下：
+```bash
+i: -268369921
+ ff ff 00 f0
+u: 4026597375
+ ff ff 00 f0
+```
+两者的位值相同，但是解释方式不同导致最后得到的数值不同。int 采用补码编码，最高位的 1 被解释为负权，unsigned 采用传统二进制编码。
+
+### 位扩展与数字截断
+当位长不同的两个数字进行转换时，首先进行的是位扩展（短到长）或者位截断（长到短）。
+
+位扩展的规则：
+* 如果源数是无符号数，那么进行零扩展：高位补 0
+* 如果源数是补码表示数，那么进行符号扩展：高位补符号位
+
+位截断的规则：
+* 只保留低位
+
+实验代码：
+```c
+int main(){
+    int i = 0xF000FFFF;
+    long l = (long)i;
+
+    printf("位扩展：\n");
+
+    printf("i: %d\n", i);
+    print_bytes((void *) &i, sizeof(int));
+    printf("l: %ld\n", l);
+    print_bytes((void *) &l, sizeof(long));
+    printf("\n");
+
+    unsigned ui =  0xF000FFFF;
+    l = (long)ui;
+
+    printf("ui: %u\n", ui);
+    print_bytes((void *) &ui, sizeof(unsigned));
+    printf("l: %ld\n", l);
+    print_bytes((void *) &l, sizeof(long));
+
+    printf("\n位截断：\n");
+
+    l = 0xFFFF00F0FFFFFFFF;
+    int i2 = (int)l;
+
+    printf("l: %ld\n", l);
+    print_bytes((void *) &l, sizeof(long));
+    printf("i2: %d\n", i2);
+    print_bytes((void *) &i2, sizeof(int));
+    printf("\n");
+
+    unsigned u2 = (unsigned)l;
+    printf("l: %ld\n", l);
+    print_bytes((void *) &l, sizeof(long));
+    printf("u2: %u\n", u2);
+    print_bytes((void *) &u2, sizeof(unsigned));
+
+    return 0;
+}
+```
+大端表示法机器上的运行结果：
+```bash
+位扩展：
+i: -268369921
+ ff ff 00 f0
+l: -268369921
+ ff ff 00 f0 ff ff ff ff
+
+ui: 4026597375
+ ff ff 00 f0
+l: 4026597375
+ ff ff 00 f0 00 00 00 00
+
+位截断：
+l: -280439889592321
+ ff ff ff ff f0 00 ff ff
+i2: -1
+ ff ff ff ff
+
+l: -280439889592321
+ ff ff ff ff f0 00 ff ff
+u2: 4294967295
+ ff ff ff ff
+```
+
+## 数据传送类指令
+通过复习 C 语言中整数的强制类型转换规则，我们明白了，整数强制类型转换核心就是如下几点：
+1. 如果不涉及到位长变化，那么只需要按照操作数大小进行简单复制即可
+2. 如果涉及到位长变换，那么需要根据源操作数是否为补码决定是零扩展还是符号位扩展
+
+x86-64 中的 mov 类数据传送指令对以上各种复制要求都能满足。
+
+|MOV S,D|S->D|
+|--|--|
+|movb S,D|移动字节到目的操作数|
+|movw S,D|移动字到目的操作数|
+|movl S,D|移动双字到目的操作数|
+|movq S,D|移动四字到目的操作数|
+
+这四个是最基本的 mov 指令，mov 指令会有一些限制，比如源寄存部分大小必须与 mov 的后缀匹配等等，这里不细讲。比较值得注意的是`movq`指令实际上只能以补码编码拷贝源操作数的低 32 位，然后**符号扩充**为 64 位再赋值到目标操作数。
+
+|||
+|--|--|
+|movabsq S,D|移动绝对四字到目的操作数|
+
+`movasbq`用于与`movq`匹配。作用是直接拷贝源操作数的 64 位到目标操作数。
+
+|MOVZ S,D|S->D|
+|--|--|
+|movzbw|将零扩展的字节拷贝到字|
+|movzbl|将零扩展的字节拷贝到双字|
+|movzwl|将零扩展的字拷贝到双字|
+|movzbq|将零扩展的字节拷贝到四字|
+|movzwq|将零扩展的字拷贝到四字|
+
+`MOVZ`指令执行零扩展拷贝。细心的同学可以发现，这里少了`movzlq`。这是因为在 x86-64 中，执行对寄存器的低 32 位赋值时，会自动将高 32 位置零，因此`movzlq`的效果等价于`movl`
+
+|MOVS S,D|S->D|
+|--|--|
+|movsbw|将符号扩展的字节拷贝到字|
+|movsbl|将符号扩展的字节拷贝到双字|
+|movswl|将符号扩展的字拷贝到双字|
+|movsbq|将符号扩展的字节拷贝到四字|
+|movswq|将符号扩展的字拷贝到四字|
+|movslq|将符号扩展的字拷贝到四字|
+
+`MOVS`执行符号扩展的复制。
+
+## 回到 demo
+C 代码：
+```c
+int change(int *x, long* y){
+    long r = *y;
+    *y = (long)*x;
+    return r;
+}
+```
+汇编：
+```asm
+change:
+	movq	(%rsi), %rax
+	movslq	(%rdi), %rdx
+	movq	%rdx, (%rsi)
+	ret
+```
+汇编第一行`movq (%rsi), %rax`拷贝内存中的四字到寄存器 rax 中，完成 C 语句`long r = *y;`
+
+汇编第二行`movslq (%rdi), %rdx`进行符号扩展复制，将内存中的双字符号扩展后拷贝到寄存器 rdx 中，第三行再将这个临时四字拷贝到内存。第二行第三行一起完成 C 代码`*y = (long)*x;`
+
+通过这个 demo 可以更好地理解 C 语言中整数进行强制类型装换的原理。
+
+下面再给出几个 C 强制类型转换与汇编的对应关系，相信大家仔细思考后都可以看懂。
+
+```c
+src_t *sp;
+dest_t *dp;
+
+*dp = (dest_t) *sp;
+```
+`src_t`与`dest_t`是通过`typedef`声明的数据类型，可以是 char、int、unsigned 等数据类型。假设用不同的数据类型对`src_t`和`dest_t`进行声明，变量 sp 与 dp 分别保存在寄存器%rdi 和%rsi 中，对应的汇编实现则如下：
+
+|src_t|dest_t|汇编|
+|--|--|--|
+|long|long|movq (%rdi),%rax<br>movq %rax,(%rsi)|
+|char|int|movsbl (%rdi),%eax<br>movl %eax,(%rsi)|
+|char|unsigned|movsbl (%rdi),%eax<br>movl %eax,(%rsi)|
+|unsigned char|long|movzbl (%rdi),%eax<br>movq %rax,(%rsi)|
+|int|char|movl (%rdi),%eax<br>movb %al,(%rsi)|
+|unsigned|unsigned char|movl (%rdi),%eax<br>movb %al,(%rsi)|
+|char|short|movsbw (%rdi),%ax<br>movw %ax,(%rsi)|

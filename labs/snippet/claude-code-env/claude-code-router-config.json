@@ -1,0 +1,27 @@
+{
+    "LOG": true,
+    "HOST": "127.0.0.1",
+    "Providers": [
+        {
+            "name": "custom-api",
+            "api_base_url": "custom-provider",
+            "api_key": "custom-api-key",
+            "models": [
+                "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+            ],
+            "transformer": {
+                "use": [
+                    [
+                        "maxtoken",
+                        {
+                            "max_tokens": 65536
+                        }
+                    ]
+                ]
+            }
+        }
+    ],
+    "Router": {
+        "default": "custom-api,Qwen/Qwen3-Coder-480B-A35B-Instruct"
+    }
+}

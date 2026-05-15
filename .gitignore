@@ -1,0 +1,40 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# C/C++ build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Ruby / Jekyll leftovers
+.bundle/
+.jekyll-cache/
+_site/
+vendor/bundle/
+
+# Experiment outputs and local data
+benchmark_results*/
+*.profile
+*.profile.graph
+*.log
+datasets/source/
+datasets/source_768d/
+
+# Nested source repository metadata kept only as local backup
+.git.orig/
+labs/snippet/.git.orig/

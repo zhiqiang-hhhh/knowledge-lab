@@ -1,0 +1,10 @@
+#!/bin/bash
+
+PROM_DIR="/mnt/disk6/common/prometheus-3.2.0-rc.1.linux-amd64"
+PROM_LOG="/tmp/prometheus.log"
+
+cd "$PROM_DIR" || exit 1
+
+echo "Starting Prometheus..."
+nohup sudo ./prometheus --web.listen-address=0.0.0.0:8989 > "$PROM_LOG" 2>&1 &
+echo "Prometheus started with PID $!"

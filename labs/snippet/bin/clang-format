@@ -1,0 +1,3 @@
+#!/bin/bash
+
+exec /mnt/disk4/hezhiqiang/tools/ldb_018/bin/clang-format "$@"

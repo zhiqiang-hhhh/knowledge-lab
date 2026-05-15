@@ -1,0 +1,145 @@
+---
+layout: post
+title:  "程序的机器级表示【3】"
+date:   2020-12-25 15:49:00 +0800
+categories: jekyll update
+---
+<script src="https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML" type="text/javascript"></script>
+
+个人觉得前面两节还是比较有意思的，毕竟开始总是分分钟都妙不可言。现在到了这一节，我们就需要学习一些个人感觉比较平淡，但是却非常重要起承上启下作用的内容了。它们就是：各种算术和逻辑运算指令，以及一些控制指令。
+
+这些指令构成了实际汇编代码中的绝大多数内容，算术和逻辑运算构成了“肉体”，控制指令则充当了代码的“骨骼”。
+
+## 算数和逻辑运算指令
+
+在开始介绍算数和逻辑运算指令之前，我们需要先复习一下 C 语言中的的算术运算规则。
+### 整数运算
+C 语言中将整数区分为有符号数和无符号数两大类。
+#### 无符号数加法
+无符号数加法很好理解。因为 C 语言采用了固定字长来编码数字，因此必定会出现两个无符号数相加时，数值超出当前字长最大值的情况。当发生溢出时，丢掉溢出的那个 1，那么从数学角度来看，无符号数加法发生溢出时得到的值就等价于对当前字长的最大值 +1 取模。
+
+如何判断发生溢出：假设 S=X+Y，当且仅当 S < X 或 S < Y 时，发生了溢出。
+具体推导这里不表。
+
+无符号数求反：假设当前 w 位的无符号数值为 x，对它按位求反得到的结果是 2<sup>w</sup> -x
+
+#### 补码加法
+假设 x 和 y 都是 w 位的补码表示数，那么首先它俩的值域为[-2<sup>w-1</sup>,2<sup>w-1</sup>-1]。和的值域为[-2<sup>w</sup>,2<sup>w</sup>-2]，如果要完整表达和的值域，很明显需要 w+1 位才行，因此补码加法也可能发生溢出。
+
+当补码加法发生溢出时，处理方法依然是将结果截断为 w 位（丢掉最后的进位 1），然后再将这 w 位看做补码。
+
+最后的结果就是：
+1. 当发生正移除时，最后的结果等于将溢出之前的正确值减去 2^w
+2. 发生负溢出时，得到的记过等于将溢出之前的正确值加上 2^w
+
+推导：假设 x 和 y 都是 w 位的补码表示数，z = x + y。当补码加法发生溢出时，若不进行进位的舍去，那么我们可以得到正确的 z，一共 w + 1 位，其表达式为：<a href="https://www.codecogs.com/eqnedit.php?latex=\inline&space;\small&space;z&space;=&space;-2^{w}x_{w}&plus;\sum_{i=0}^{w-1}2^{i}x_{i}" target="_blank"><img src="https://latex.codecogs.com/gif.latex?\inline&space;\small&space;z&space;=&space;-2^{w}x_{w}&plus;\sum_{i=0}^{w-1}2^{i}x_{i}" title="\small z = -2^{w}x_{w}+\sum_{i=0}^{w-1}2^{i}x_{i}" /></a>
+
+假设发生了正溢出，我们需要将 z 的 w + 1 位丢掉，然后以补码编码解释剩下的 w 位，<a href="https://www.codecogs.com/eqnedit.php?latex=\inline&space;\small&space;z_{1}=-2^{w-1}x_{w-1}&plus;\sum^{w-2}_{i=0}2^{i}x_{i}" target="_blank"><img src="https://latex.codecogs.com/gif.latex?\inline&space;\small&space;z_{1}=-2^{w-1}x_{w-1}&plus;\sum^{w-2}_{i=0}2^{i}x_{i}" title="\small z_{1}=-2^{w-1}x_{w-1}+\sum^{w-2}_{i=0}2^{i}x_{i}" /></a>，所以<a href="https://www.codecogs.com/eqnedit.php?latex=\inline&space;\small&space;z_{1}=z&plus;2^{w}x_{w}-2*2^{w-1}x_{w-1}" target="_blank"><img src="https://latex.codecogs.com/gif.latex?\inline&space;\small&space;z_{1}=z&plus;2^{w}x_{w}-2*2^{w-1}x_{w-1}" title="\small z_{1}=z+2^{w}x_{w}-2*2^{w-1}x_{w-1}" /></a>，注意正溢出时有<a href="https://www.codecogs.com/eqnedit.php?latex=\inline&space;\small&space;x_{w}=0,x_{1}=1" target="_blank"><img src="https://latex.codecogs.com/gif.latex?\inline&space;\small&space;x_{w}=0,x_{1}=1" title="\small x_{w}=0,x_{1}=1" /></a>，所以<a href="https://www.codecogs.com/eqnedit.php?latex=\inline&space;\small&space;z_{1}=z-2^{w}" target="_blank"><img src="https://latex.codecogs.com/gif.latex?\inline&space;\small&space;z_{1}=z-2^{w}" title="\small z_{1}=z-2^{w}" /></a>
+
+负溢出时同理，只不过负溢出时有<a href="https://www.codecogs.com/eqnedit.php?latex=\inline&space;\small&space;x_{w}=1,x_{1}=0" target="_blank"><img src="https://latex.codecogs.com/gif.latex?\inline&space;\small&space;x_{w}=1,x_{1}=0" title="\small x_{w}=1,x_{1}=0" /></a>，所以<a href="https://www.codecogs.com/eqnedit.php?latex=\inline&space;\small&space;z_{2}=z&plus;2^{w}" target="_blank"><img src="https://latex.codecogs.com/gif.latex?\inline&space;\small&space;z_{2}=z&plus;2^{w}" title="\small z_{2}=z+2^{w}" /></a>。
+
+### 机器指令中的数
+实际上，无符号数是 C 语言自己抽象出来的一种逻辑类型，**所有机器指令上运行的数都是按照补码表示计算的**。也就是说，当你在 C 代码中写了一个无符号数时，C 编译器又会把它转为一个位级表示相同的补码数字交给机器指令运算，然后再将结果重新按照无符号数规则解释出来。
+比如：
+```c
+void unsigned_test(unsigned long* ulp){
+    unsigned long ul = 0xFFFFFFFF00000000;
+    *ulp = ul;
+}
+```
+对应的汇编：
+```asm
+unsigned_test:
+	movabsq	$-4294967296, %rax
+	movq	%rax, (%rdi)
+	ret
+```
+可以看到无符号数 ul 实际上使用的是补码。
+
+因此，对于无符号数的减法 a - b，实际上的流程是：
+1. 编译器编译出 a<sub>补</sub> + (-b)<sub>补</sub>
+2. CPU（加法器 ALU）按照补码加法运算计算结果，设置条件码寄存器
+3. 编译器编译出的汇编代码将补码重新解释为无符号数
+
+### 机器指令中的算术和逻辑运算
+#### leaq
+`leaq S,D` leaq 从指令形式来看是从内存读数据到寄存器。
+
+实际上，leaq 并不会引用内存，它只是将 S 中多个寄存器值计算出来的内存有效地址赋值给 D 寄存器。
+
+比如`leaq (%rdi, %rsi, 4), %rax`，作用是计算`%rdi + 4*%rsi`，然后将结果赋值给%rax。
+
+#### 其他
+其他指令很容易看懂，比如`INC D`，作用是将 D 寄存器中的值 +1。这里就不细写了，后面遇到了再说。
+
+## 控制指令
+
+除了运算指令之外，还需要控制指令。控制指令可以根据测试结果改变指令执行顺序。
+
+测试结果使用保存单个位的条件码寄存器保存。最常用的条件码寄存器有：
+* CF: 进位标志。最近的操作使最高位产生了进位，可用来检查无符号数的溢出
+* ZF: 零标志。最近的操作得出的结果为 0。
+* SF: 符号标志。最近的操作得到了负数。
+* OF: 溢出标志。最近的操作导致补码溢出。
+
+### 设置条件码
+之前提到的算数运算指令可以设置条件码寄存器。
+
+CMP 与 TEST 指令也可以设置条件码寄存器。
+
+其中 CMP 指令是根据两个操作数之差来设置条件码，因此除了不会设置通用寄存器的值外，CMP 指令执行的操作与 SUB 指令的一样的。
+### 访问条件码
+SET 指令根据条件码寄存器的组合结果设置目标寄存器的值。比如：
+
+|指令名 | 设置条件|
+|--|--|
+|sete|相等|
+|setg|大于|
+
+还有 setl 等。我们前面提到，机器指令层面是不区分无符号数和有符号数的，一律采用补码表示数进行运算。那么当涉及到无符号数时，C 编译器该如何使用机器指令进行条件判断呢。
+
+比如有一段汇编：
+```asm
+comp:
+    compq %rsi, %rdi
+    setl %al
+    movzbl %sl, %eax
+    ret
+```
+我们先从有符号数开始。假设 rsi 和 rdi 依次保存的是`int32_t a`和`int32_t b`。`compq`比较四字，根据运算 t=b-a（注意是 b-a）的结果来设置条件码寄存器。如果有 b < a，那么`setl`将会把 %al 设置为 0，否则设置为 1。
+
+如果计算 b+(-a) 时没有发生溢出（OF 寄存器为 0），那么只需要判断 t 是否为负数即可（SF 寄存器是否为 1）.
+
+如果发生了负溢出（OF 寄存器为 1，SF 寄存器为 1）说明 b - a < 0，那么 b > a。如果发生了正溢出（OF 寄存器为 1，SF 寄存器为 0），那么 b < a。
+
+对于无符号数比较，首先无符号数是语言层面的逻辑抽象，当编译器遇到无符号数比较时，会将无符号数的比较转换为对应有符号数的比较，具体转换方法这里就不细说了。
+
+### 跳转指令与编码
+跳转指令导致程序从一个指令跳转到另一条指令。
+```asm
+    movq $0,%rax
+    jmp .L1
+    movq (%rax),%rdx
+.L1:
+    popq %rdx
+```
+跳过 movq，直接去执行 popq。关于跳转目标的编码我们到后边遇到讲到链接器时再介绍。
+
+
+## 条件分支的实现
+
+条件分支的实现非常简单，这里不细说。具体可以看 CSAPP。
+
+这里说一下对条件分支两种不同实现的理解。
+
+一种是最基本的基于条件跳转的实现。这种实现从汇编翻译过来到 C 代码就是类似 goto 的风格，很好理解。
+
+还有一种则是基于条件传送指令的实现。这类实现首先计算两个条件分支的所有结果，然后再根据条件判断结果来决定返回哪个结果。
+
+前者直观上感觉实现更加自然高效：毕竟条件传送指令明显会做无用功。但是实际上基于现代 CPU 的流水线技术，基于条件传送指令的实现有时反而会更加高效。
+
+原因在于，CPU 广泛使用分支预测技术来执行条件跳转语句，但是，当条件判断结果无法预测（比如硬币正反的概率都是 50%）时，分支预测技术就难以正确命中。带来的代价就是一旦分支预测错误，会带来昂贵的“重新装填子弹”的开销。
+
+而条件传送指令虽然直观上看增加了无用功——预先计算所有的分支结果，但是这种方式摆脱了对分支预测准确率的依赖，基于流水线技术，可以使 CPU 充满待执行的指令，这样多个指令并行执行，反而使得总的运行时间降低。不过，如果计算分值结果的代价过大，基于条件传送指令的实现也会变得更慢。
+
+具体编译器选择哪种实现，作为程序员我们是无法预测的。但是理解这两种实现的区别，也可以是一个可以用来茶余饭后吹牛的谈资。Salute！
