@@ -64,7 +64,7 @@
 
 `--dbs` 非必填，默认扫描所有非系统库。`--dbs-exclude` 可以显式排除库。脚本不会在 SQL 里使用 `LIMIT` 或 `OFFSET`，而是在 Python 内部对候选表排序并切 batch。
 
-默认 batch size 是 `10`。脚本会在扫描完成后打印汇总：需要处理的 database 数、table 数、总行数、总 size，以及按 database 排序的处理顺序：
+默认 batch size 是 `10`。脚本会在扫描完成后打印汇总：需要处理的 database 数、table 数、总行数、总 size，以及按 database 总 size 降序排序的处理顺序。batch 也按 database 总 size 降序选择表，同一个 database 内按表名排序：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \

@@ -458,9 +458,8 @@ def print_processing_summary(plans: list[TablePlan]) -> None:
     if not by_db:
         return
 
-    print("Database processing order:")
-    for index, database in enumerate(sorted(by_db), start=1):
-        db_plans = by_db[database]
+    print("Database processing order by size desc:")
+    for index, (database, db_plans) in enumerate(database_plan_order(by_db), start=1):
         db_rows = sum(plan.table.total_rows for plan in db_plans)
         db_bytes = sum(plan.table.total_bytes for plan in db_plans)
         print(
@@ -468,6 +467,30 @@ def print_processing_summary(plans: list[TablePlan]) -> None:
             f"size={format_readable_size(db_bytes)}"
         )
     print()
+
+
+def database_plan_order(by_db: dict[str, list[TablePlan]]) -> list[tuple[str, list[TablePlan]]]:
+    return sorted(
+        by_db.items(),
+        key=lambda item: (
+            -sum(plan.table.total_bytes for plan in item[1]),
+            item[0],
+        ),
+    )
+
+
+def sort_plans_by_database_size(plans: list[TablePlan]) -> list[TablePlan]:
+    db_bytes: dict[str, int] = {}
+    for plan in plans:
+        db_bytes[plan.table.database] = db_bytes.get(plan.table.database, 0) + plan.table.total_bytes
+    return sorted(
+        plans,
+        key=lambda plan: (
+            -db_bytes[plan.table.database],
+            plan.table.database,
+            plan.table.name,
+        ),
+    )
 
 
 def execute_alter_batch(client, batch: list[TablePlan]) -> None:
@@ -744,6 +767,7 @@ def main(argv: list[str]) -> int:
                     f"{index}/{len(tables)} tables for materialize; planned={len(plans)}, skipped={len(skipped)}, "
                     f"current={table.database}.{table.name}",
                 )
+        plans = sort_plans_by_database_size(plans)
         batch = select_batch(args, plans)
         if args.all_batches:
             log(args, f"Selected all materialize batches: {len(batch)} tables")
@@ -778,6 +802,7 @@ def main(argv: list[str]) -> int:
                     f"{index}/{len(tables)} tables; planned={len(plans)}, skipped={len(skipped)}, "
                     f"current={table.database}.{table.name}",
                 )
+        plans = sort_plans_by_database_size(plans)
         batch = select_batch(args, plans)
         if args.all_batches:
             log(args, f"Selected all batches: {len(batch)} tables")
