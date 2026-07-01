@@ -77,6 +77,43 @@ def split_csv(value: str | None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def unquote_filter_identifier(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == "`" and value[-1] == "`":
+        return value[1:-1].replace("``", "`")
+    return value
+
+
+def parse_table_filters(value: str | None) -> tuple[set[str], set[tuple[str, str]]]:
+    unqualified = set()
+    qualified = set()
+    for item in split_csv(value):
+        if "." in item:
+            database, table = item.split(".", 1)
+            qualified.add((unquote_filter_identifier(database), unquote_filter_identifier(table)))
+        else:
+            unqualified.add(unquote_filter_identifier(item))
+    return unqualified, qualified
+
+
+def table_filter_sql(
+    table_argument: str | None,
+    database_column: str = "database",
+    table_column: str = "name",
+) -> str | None:
+    unqualified, qualified = parse_table_filters(table_argument)
+    clauses = []
+    if unqualified:
+        clauses.append(f"{table_column} IN (" + ", ".join(quote_literal(name) for name in sorted(unqualified)) + ")")
+    for database, table in sorted(qualified):
+        clauses.append(
+            f"({database_column} = {quote_literal(database)} AND {table_column} = {quote_literal(table)})"
+        )
+    if not clauses:
+        return None
+    return "(" + " OR ".join(clauses) + ")"
+
+
 def get_client(args: argparse.Namespace):
     if clickhouse_connect is None:
         raise RuntimeError(
@@ -313,6 +350,9 @@ def fetch_tables(client, args: argparse.Namespace) -> list[TableInfo]:
         where.append("database IN (" + ", ".join(quote_literal(db) for db in sorted(included)) + ")")
     if excluded:
         where.append("database NOT IN (" + ", ".join(quote_literal(db) for db in sorted(excluded)) + ")")
+    table_filter = table_filter_sql(args.tables)
+    if table_filter:
+        where.append(table_filter)
 
     query = f"""
         SELECT
@@ -711,6 +751,9 @@ def fetch_pending_materialize_states(client, args: argparse.Namespace) -> list[M
         filters.append("database IN (" + ", ".join(quote_literal(db) for db in sorted(included)) + ")")
     if excluded:
         filters.append("database NOT IN (" + ", ".join(quote_literal(db) for db in sorted(excluded)) + ")")
+    table_filter = table_filter_sql(args.tables, table_column="table")
+    if table_filter:
+        filters.append(table_filter)
 
     rows = query_rows(
         client,
@@ -781,6 +824,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--database", default=None, help="Default database for the connection.")
     parser.add_argument("--dbs", help="Comma-separated databases to include. Defaults to all non-system databases.")
     parser.add_argument("--dbs-exclude", help="Comma-separated databases to exclude.")
+    parser.add_argument(
+        "--tables",
+        help=(
+            "Comma-separated tables to include. Supports unqualified table names or qualified db.table names."
+        ),
+    )
     parser.add_argument("--target-policy", default="s3_tier")
     parser.add_argument("--cold-volume", default="cold")
     parser.add_argument("--codec", default="ZSTD(12)")

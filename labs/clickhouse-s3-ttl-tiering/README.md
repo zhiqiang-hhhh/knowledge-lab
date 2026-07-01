@@ -76,7 +76,7 @@ python3 plan_s3_ttl_tiering.py \
 
 ## Batch 语义
 
-`--dbs` 非必填，默认扫描所有非系统库。`--dbs-exclude` 可以显式排除库。脚本不会在 SQL 里使用 `LIMIT` 或 `OFFSET`，而是在 Python 内部对候选表排序并切 batch。
+`--dbs` 非必填，默认扫描所有非系统库。`--dbs-exclude` 可以显式排除库。`--tables` 可以进一步限制表范围，支持不带库名的 `table1,table2`，也支持带库名的 `db1.table1,db2.table2`。脚本不会在 SQL 里使用 `LIMIT` 或 `OFFSET`，而是在 Python 内部对候选表排序并切 batch。
 
 默认 batch size 是 `10`。脚本会在扫描完成后打印汇总：需要处理的 database 数、table 数、总行数、总 size，以及按 database 总 size 降序排序的处理顺序。batch 也按 database 总 size 降序选择表，同一个 database 内按表名排序：
 
@@ -88,6 +88,25 @@ python3 plan_s3_ttl_tiering.py \
   --http-port 8123 \
   --batch 0 \
   --batch-size 10
+```
+
+只检查指定表：
+
+```bash
+python3 plan_s3_ttl_tiering.py \
+  --host 127.0.0.1 \
+  --http-port 8123 \
+  --dbs target_db \
+  --tables table_a,table_b
+```
+
+跨库精确指定表：
+
+```bash
+python3 plan_s3_ttl_tiering.py \
+  --host 127.0.0.1 \
+  --http-port 8123 \
+  --tables db_a.table_a,db_b.table_b
 ```
 
 默认只处理当前 batch。要一次性处理全部 planned tables，需要显式加 `--all-batches`：
