@@ -244,38 +244,6 @@ def remove_existing_tiering_ttl_entries(
     return kept, None
 
 
-def extract_single_argument(function_name: str, expression: str) -> str | None:
-    pattern = re.compile(rf"\b{re.escape(function_name)}\s*\(", flags=re.IGNORECASE)
-    match = pattern.search(expression)
-    if not match:
-        return None
-
-    start = match.end()
-    depth = 1
-    quote = None
-    i = start
-    while i < len(expression):
-        ch = expression[i]
-        if quote:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-            i += 1
-            continue
-        if ch in {"'", '"', "`"}:
-            quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return expression[start:i].strip()
-        i += 1
-    return None
-
-
 def partition_key_kind(partition_key: str) -> str | None:
     if re.search(r"\b(?:toMonday|toStartOfWeek)\s*\(", partition_key, flags=re.IGNORECASE):
         return "week"
