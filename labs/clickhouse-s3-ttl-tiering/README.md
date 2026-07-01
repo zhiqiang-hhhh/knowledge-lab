@@ -80,6 +80,8 @@ python3 plan_s3_ttl_tiering.py \
 
 默认 batch size 是 `10`。脚本会在扫描完成后打印汇总：需要处理的 database 数、table 数、总行数、总 size，以及按 database 总 size 降序排序的处理顺序。batch 也按 database 总 size 降序选择表，同一个 database 内按表名排序：
 
+每张表的输出分成两段：`current` 展示当前 `storage_policy` 和当前 `TTL MOVE` / `TTL RECOMPRESS` / `TTL DELETE`；`planned` 展示脚本计划写入的新 `storage_policy` 和新 `TTL`。在修复模式下，这可以直接看到旧的冷分层表达式和计划修正后的表达式。
+
 ```bash
 python3 plan_s3_ttl_tiering.py \
   --host 127.0.0.1 \

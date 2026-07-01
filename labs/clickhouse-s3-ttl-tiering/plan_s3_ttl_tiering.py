@@ -31,6 +31,10 @@ class TableInfo:
 class TablePlan:
     table: TableInfo
     move_expr: str
+    current_ttl_move_entries: list[str]
+    current_ttl_recompress_entries: list[str]
+    current_ttl_delete_entries: list[str]
+    current_ttl_other_entries: list[str]
     ttl_delete_entries: list[str]
     statements: list[str]
 
@@ -215,6 +219,25 @@ def validate_delete_only_ttl(entries: list[str]) -> tuple[list[str] | None, str 
     return accepted, None
 
 
+def classify_ttl_entries(entries: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
+    move_entries = []
+    recompress_entries = []
+    delete_entries = []
+    other_entries = []
+
+    for entry in entries:
+        if re.search(r"\bTO\s+(?:VOLUME|DISK)\b", entry, flags=re.IGNORECASE):
+            move_entries.append(entry)
+        elif re.search(r"\bRECOMPRESS\b", entry, flags=re.IGNORECASE):
+            recompress_entries.append(entry)
+        elif re.search(r"\bGROUP\s+BY\b|\bDELETE\s+WHERE\b", entry, flags=re.IGNORECASE):
+            other_entries.append(entry)
+        else:
+            delete_entries.append(entry)
+
+    return move_entries, recompress_entries, delete_entries, other_entries
+
+
 def remove_existing_tiering_ttl_entries(
     args: argparse.Namespace,
     entries: list[str],
@@ -351,6 +374,13 @@ def build_plan_for_table(
     if error:
         return None, error
 
+    (
+        current_move_entries,
+        current_recompress_entries,
+        current_delete_entries,
+        current_other_entries,
+    ) = classify_ttl_entries(ttl_entries or [])
+
     if repair_existing_ttl:
         ttl_entries, error = remove_existing_tiering_ttl_entries(args, ttl_entries or [])
         if error:
@@ -383,6 +413,10 @@ def build_plan_for_table(
         TablePlan(
             table=table,
             move_expr=move_expr or "",
+            current_ttl_move_entries=current_move_entries,
+            current_ttl_recompress_entries=current_recompress_entries,
+            current_ttl_delete_entries=current_delete_entries,
+            current_ttl_other_entries=current_other_entries,
             ttl_delete_entries=delete_entries or [],
             statements=statements,
         ),
@@ -403,6 +437,10 @@ def build_materialize_plan_for_table(args: argparse.Namespace, table: TableInfo)
         TablePlan(
             table=table,
             move_expr="existing TTL MOVE expression",
+            current_ttl_move_entries=[],
+            current_ttl_recompress_entries=[],
+            current_ttl_delete_entries=[],
+            current_ttl_other_entries=[],
             ttl_delete_entries=[],
             statements=[],
         ),
@@ -494,6 +532,14 @@ def sort_plans_by_database_size(plans: list[TablePlan]) -> list[TablePlan]:
             plan.table.name,
         ),
     )
+
+
+def print_entries(indent: str, entries: list[str]) -> None:
+    if not entries:
+        print(f"{indent}(none)")
+        return
+    for entry in entries:
+        print(f"{indent}{entry}")
 
 
 def execute_alter_batch(client, batch: list[TablePlan]) -> None:
@@ -890,11 +936,24 @@ def main(argv: list[str]) -> int:
             print("    MATERIALIZE plan:")
             print("      " + materialize_statement(args, plan))
         else:
-            print(f"    move/recompress: {plan.move_expr}")
-            print("    existing TTL DELETE:")
-            for entry in plan.ttl_delete_entries:
-                print(f"      {entry}")
-            print("    ALTER plan:")
+            print("    current:")
+            print(f"      storage_policy: {plan.table.storage_policy}")
+            print("      TTL MOVE:")
+            print_entries("        ", plan.current_ttl_move_entries)
+            print("      TTL RECOMPRESS:")
+            print_entries("        ", plan.current_ttl_recompress_entries)
+            print("      TTL DELETE:")
+            print_entries("        ", plan.current_ttl_delete_entries)
+            if plan.current_ttl_other_entries:
+                print("      TTL other:")
+                print_entries("        ", plan.current_ttl_other_entries)
+            print("    planned:")
+            print(f"      storage_policy: {args.target_policy}")
+            print(f"      TTL MOVE: {plan.move_expr} TO VOLUME {quote_literal(args.cold_volume)}")
+            print(f"      TTL RECOMPRESS: {plan.move_expr} RECOMPRESS CODEC({args.codec})")
+            print("      TTL DELETE:")
+            print_entries("        ", plan.ttl_delete_entries)
+            print("    ALTER statements:")
             for statement in plan.statements:
                 print("      " + statement.replace("\n", "\n      "))
         print()
