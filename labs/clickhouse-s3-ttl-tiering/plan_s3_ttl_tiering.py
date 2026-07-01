@@ -849,7 +849,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--weekly-hot-weeks", type=int, default=2)
     parser.add_argument("--daily-hot-days", type=int, default=8)
-    parser.add_argument("--mutations-sync", type=int, default=0)
+    parser.add_argument("--mutations-sync", type=int, default=2)
     parser.add_argument("--wait-materialize", action="store_true")
     parser.add_argument(
         "--max-pending-materialize",

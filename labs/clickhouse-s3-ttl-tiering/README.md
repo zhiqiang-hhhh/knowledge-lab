@@ -29,10 +29,10 @@
    这一步不会触发历史数据搬迁。
 
 3. `materialize`
-   通过 `--execute-materialize` 单独提交当前 batch 的 `MATERIALIZE TTL` mutation。默认使用 `mutations_sync = 0`，只提交后台任务，不同步等待。
+   通过 `--execute-materialize` 单独提交当前 batch 的 `MATERIALIZE TTL` mutation。默认使用 `mutations_sync = 2`，同步等待当前节点执行完成。
 
    ```sql
-   ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 0;
+   ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 2;
    ```
 
 `MATERIALIZE TTL` 阶段也是无状态的：脚本重新扫描当前表状态，只选择已经使用目标 `storage_policy`，并且当前 `TTL` 里已经包含 `TO VOLUME 'cold'` 和 `RECOMPRESS` 的表。`--resume-materialize` 不读取本地 state file，而是直接从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation。
@@ -164,7 +164,19 @@ python3 plan_s3_ttl_tiering.py \
   --execute-alter
 ```
 
-提交当前 batch 的 `MATERIALIZE TTL`，不等待完成：
+提交当前 batch 的 `MATERIALIZE TTL`，默认同步等待当前节点执行完成：
+
+```bash
+python3 plan_s3_ttl_tiering.py \
+  --host 127.0.0.1 \
+  --http-port 8123 \
+  --target-policy s3_tier \
+  --cold-volume cold \
+  --output-dir . \
+  --execute-materialize
+```
+
+需要异步提交时，显式设置 `--mutations-sync 0`：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -177,7 +189,7 @@ python3 plan_s3_ttl_tiering.py \
   --mutations-sync 0
 ```
 
-`MATERIALIZE TTL` 提交默认是串行限流的：`--max-pending-materialize 1`。脚本提交下一张表之前，会等待当前匹配范围内未完成的 `MATERIALIZE TTL` mutation 数量低于该阈值，避免一次性塞入过多后台任务。需要提高并发时显式调大：
+`MATERIALIZE TTL` 提交默认是串行限流的：`--max-pending-materialize 1`。脚本提交下一张表之前，会等待当前匹配范围内未完成的 `MATERIALIZE TTL` mutation 数量低于该阈值，避免一次性塞入过多后台任务。使用默认同步模式时，这个阈值通常不会被触发；异步提交时它用于限制后台队列压力。需要提高异步并发时显式调大：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -186,10 +198,11 @@ python3 plan_s3_ttl_tiering.py \
   --target-policy s3_tier \
   --cold-volume cold \
   --execute-materialize \
+  --mutations-sync 0 \
   --max-pending-materialize 3
 ```
 
-提交并轮询等待，超时后只记录状态，不重试、不 kill mutation：
+异步提交并轮询等待，超时后只记录状态，不重试、不 kill mutation：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
