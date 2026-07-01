@@ -795,6 +795,9 @@ def main(argv: list[str]) -> int:
             print("      " + materialize_statement(args, plan))
         else:
             print(f"    move/recompress: {plan.move_expr}")
+            print("    existing TTL DELETE:")
+            for entry in plan.ttl_delete_entries:
+                print(f"      {entry}")
             print("    ALTER plan:")
             for statement in plan.statements:
                 print("      " + statement.replace("\n", "\n      "))
