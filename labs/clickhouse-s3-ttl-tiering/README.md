@@ -142,6 +142,18 @@ python3 plan_s3_ttl_tiering.py \
   --mutations-sync 0
 ```
 
+`MATERIALIZE TTL` 提交默认是串行限流的：`--max-pending-materialize 1`。脚本提交下一张表之前，会等待当前匹配范围内未完成的 `MATERIALIZE TTL` mutation 数量低于该阈值，避免一次性塞入过多后台任务。需要提高并发时显式调大：
+
+```bash
+python3 plan_s3_ttl_tiering.py \
+  --host 127.0.0.1 \
+  --http-port 8123 \
+  --target-policy s3_tier \
+  --cold-volume cold \
+  --execute-materialize \
+  --max-pending-materialize 3
+```
+
 提交并轮询等待，超时后只记录状态，不重试、不 kill mutation：
 
 ```bash

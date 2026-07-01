@@ -599,6 +599,26 @@ def submit_materialize(client, args: argparse.Namespace, plan: TablePlan) -> Mut
     )
 
 
+def wait_for_materialize_submit_capacity(client, args: argparse.Namespace) -> None:
+    deadline = time.monotonic() + args.materialize_timeout_seconds
+    while True:
+        pending = fetch_pending_materialize_states(client, args)
+        if len(pending) < args.max_pending_materialize:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "timed out waiting for MATERIALIZE TTL mutation queue capacity; "
+                f"pending={len(pending)}, max_pending={args.max_pending_materialize}"
+            )
+        log(
+            args,
+            "Waiting before submitting next MATERIALIZE TTL; "
+            f"pending={len(pending)}, max_pending={args.max_pending_materialize}, "
+            f"parts_to_do={sum(state.parts_to_do for state in pending)}",
+        )
+        time.sleep(args.materialize_poll_seconds)
+
+
 def refresh_materialize_states(client, states: list[MutationState]) -> list[MutationState]:
     refreshed = []
     for state in states:
@@ -675,8 +695,25 @@ def execute_materialize_batch(client, args: argparse.Namespace, batch: list[Tabl
         log(args, "Scanning system.mutations for pending MATERIALIZE TTL mutations")
         states = fetch_pending_materialize_states(client, args)
     else:
-        log(args, f"Submitting MATERIALIZE TTL for {len(batch)} tables")
-        states = [submit_materialize(client, args, plan) for plan in batch]
+        log(
+            args,
+            "Submitting MATERIALIZE TTL serially; "
+            f"tables={len(batch)}, max_pending={args.max_pending_materialize}",
+        )
+        states = []
+        for index, plan in enumerate(batch, start=1):
+            existing = pending_materialize_mutation(client, plan.table.database, plan.table.name)
+            if existing:
+                log(
+                    args,
+                    "Reusing existing pending MATERIALIZE TTL "
+                    f"{index}/{len(batch)} for {plan.table.database}.{plan.table.name}: {existing.mutation_id}",
+                )
+                states.append(existing)
+                continue
+            wait_for_materialize_submit_capacity(client, args)
+            log(args, f"Submitting MATERIALIZE TTL {index}/{len(batch)}")
+            states.append(submit_materialize(client, args, plan))
     if args.wait_materialize:
         log(args, f"Polling MATERIALIZE TTL state for up to {args.materialize_timeout_seconds} seconds")
         states = wait_for_materialize(client, args, states)
@@ -713,6 +750,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--daily-hot-days", type=int, default=8)
     parser.add_argument("--mutations-sync", type=int, default=0)
     parser.add_argument("--wait-materialize", action="store_true")
+    parser.add_argument(
+        "--max-pending-materialize",
+        type=int,
+        default=1,
+        help="Maximum pending MATERIALIZE TTL mutations before submitting the next table.",
+    )
     parser.add_argument("--materialize-timeout-seconds", type=int, default=3600)
     parser.add_argument("--materialize-poll-seconds", type=float, default=5.0)
     parser.add_argument("--log-every", type=int, default=100, help="Print scan progress every N tables. Use 0 to disable.")
@@ -730,6 +773,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--daily-hot-days must be at least 7")
     if args.mutations_sync not in {0, 1, 2}:
         parser.error("--mutations-sync must be 0, 1, or 2")
+    if args.max_pending_materialize <= 0:
+        parser.error("--max-pending-materialize must be positive")
     if args.materialize_timeout_seconds <= 0:
         parser.error("--materialize-timeout-seconds must be positive")
     if args.materialize_poll_seconds <= 0:
