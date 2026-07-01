@@ -215,6 +215,35 @@ def validate_delete_only_ttl(entries: list[str]) -> tuple[list[str] | None, str 
     return accepted, None
 
 
+def remove_existing_tiering_ttl_entries(
+    args: argparse.Namespace,
+    entries: list[str],
+) -> tuple[list[str] | None, str | None]:
+    kept = []
+    removed_move = 0
+    removed_recompress = 0
+    volume_pattern = re.compile(
+        rf"\bTO\s+VOLUME\s+(?:\\?'|\")?{re.escape(args.cold_volume)}(?:\\?'|\")?",
+        flags=re.IGNORECASE,
+    )
+    recompress_pattern = re.compile(r"\bRECOMPRESS\s+CODEC\s*\(", flags=re.IGNORECASE)
+
+    for entry in entries:
+        if volume_pattern.search(entry):
+            removed_move += 1
+            continue
+        if recompress_pattern.search(entry):
+            removed_recompress += 1
+            continue
+        kept.append(entry)
+
+    if not removed_move:
+        return None, f"repair mode found no existing TTL MOVE to volume {args.cold_volume}"
+    if not removed_recompress:
+        return None, "repair mode found no existing TTL RECOMPRESS entry"
+    return kept, None
+
+
 def extract_single_argument(function_name: str, expression: str) -> str | None:
     pattern = re.compile(rf"\b{re.escape(function_name)}\s*\(", flags=re.IGNORECASE)
     match = pattern.search(expression)
@@ -247,30 +276,25 @@ def extract_single_argument(function_name: str, expression: str) -> str | None:
     return None
 
 
+def partition_key_kind(partition_key: str) -> str | None:
+    if re.search(r"\b(?:toMonday|toStartOfWeek)\s*\(", partition_key, flags=re.IGNORECASE):
+        return "week"
+    if re.search(r"\b(?:toDate|toStartOfDay)\s*\(", partition_key, flags=re.IGNORECASE):
+        return "day"
+    return None
+
+
 def infer_move_expr(args: argparse.Namespace, partition_key: str) -> tuple[str | None, str | None]:
     if args.time_column:
-        time_expr = quote_identifier(args.time_column)
-    else:
-        time_expr = None
+        return None, "--time-column is no longer supported; TTL MOVE uses partition_key directly"
 
-    weekly_arg = (
-        extract_single_argument("toStartOfWeek", partition_key)
-        or extract_single_argument("toMonday", partition_key)
-    )
-    if weekly_arg:
-        time_expr = time_expr or weekly_arg
-        return f"toStartOfWeek({time_expr}) + INTERVAL {args.weekly_hot_weeks} WEEK", None
+    kind = partition_key_kind(partition_key)
+    if kind == "week":
+        return f"{partition_key} + INTERVAL {args.weekly_hot_weeks} WEEK", None
+    if kind == "day":
+        return f"{partition_key} + INTERVAL {args.daily_hot_days} DAY", None
 
-    daily_arg = (
-        extract_single_argument("toDate", partition_key)
-        or extract_single_argument("toStartOfDay", partition_key)
-        or extract_single_argument("toYYYYMMDD", partition_key)
-    )
-    if daily_arg:
-        time_expr = time_expr or daily_arg
-        return f"toDate({time_expr}) + INTERVAL {args.daily_hot_days} DAY", None
-
-    return None, f"unsupported partition key: {partition_key}"
+    return None, f"unsupported Date-like partition key: {partition_key}"
 
 
 def fetch_storage_policies(client) -> dict[str, set[str]]:
@@ -334,7 +358,13 @@ def build_plan_for_table(
     policy_volumes: dict[str, set[str]],
     table: TableInfo,
 ) -> tuple[TablePlan | None, str | None]:
-    if table.storage_policy == args.target_policy and not args.allow_already_policy:
+    repair_existing_ttl = bool(args.repair_existing_tiering_ttl and table.storage_policy == args.target_policy)
+    if args.repair_existing_tiering_ttl and table.storage_policy != args.target_policy:
+        return None, (
+            "repair mode only handles tables already using storage policy "
+            f"{args.target_policy}; current policy is {table.storage_policy}"
+        )
+    if table.storage_policy == args.target_policy and not (args.allow_already_policy or repair_existing_ttl):
         return None, f"already uses storage policy {args.target_policy}"
     if table.storage_policy not in {"default", args.target_policy} and not args.allow_non_default_policy:
         return None, f"current storage policy is {table.storage_policy}, not default"
@@ -352,6 +382,11 @@ def build_plan_for_table(
     ttl_entries, error = extract_table_ttl_entries(table.create_table_query)
     if error:
         return None, error
+
+    if repair_existing_ttl:
+        ttl_entries, error = remove_existing_tiering_ttl_entries(args, ttl_entries or [])
+        if error:
+            return None, error
 
     delete_entries, error = validate_delete_only_ttl(ttl_entries or [])
     if error:
@@ -745,7 +780,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=".", help="Directory for run log and skip report.")
     parser.add_argument("--log-file", default="s3_ttl_tiering.log")
     parser.add_argument("--skip-report", default="s3_ttl_tiering_skipped.tsv")
-    parser.add_argument("--time-column", help="Override inferred time expression with this column name.")
+    parser.add_argument(
+        "--time-column",
+        help="Deprecated; rejected because TTL MOVE now uses partition_key directly.",
+    )
     parser.add_argument("--weekly-hot-weeks", type=int, default=2)
     parser.add_argument("--daily-hot-days", type=int, default=8)
     parser.add_argument("--mutations-sync", type=int, default=0)
@@ -762,6 +800,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--quiet", action="store_true", help="Disable progress logs.")
     parser.add_argument("--allow-already-policy", action="store_true")
     parser.add_argument("--allow-non-default-policy", action="store_true")
+    parser.add_argument(
+        "--repair-existing-tiering-ttl",
+        action="store_true",
+        help=(
+            "For tables already using target policy, remove existing TTL MOVE/RECOMPRESS "
+            "entries for the cold tier and rebuild them from partition_key while preserving DELETE TTL."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")

@@ -51,14 +51,28 @@
 
 ## 分区对齐
 
-`TTL MOVE` 和 `TTL RECOMPRESS` 的表达式按照表的 `partition_key` 生成：
+`TTL MOVE` 和 `TTL RECOMPRESS` 的表达式直接复用表的 `partition_key`，只根据分区粒度决定追加的 `INTERVAL`：
 
-- 周分区：识别 `toStartOfWeek` 或 `toMonday`，生成 `toStartOfWeek(<time_expr>) + INTERVAL 2 WEEK`。
-- 天分区：识别 `toDate`、`toStartOfDay` 或 `toYYYYMMDD`，生成 `toDate(<time_expr>) + INTERVAL 8 DAY`。
+- 周分区：识别 `toStartOfWeek` 或 `toMonday`，生成 `<partition_key> + INTERVAL 2 WEEK`。
+- 天分区：识别 `toDate` 或 `toStartOfDay`，生成 `<partition_key> + INTERVAL 8 DAY`。
 
 周分区使用 `INTERVAL 2 WEEK` 是为了保证周一查询上周日数据时，上周日数据仍然在本地热层。如果使用 `INTERVAL 1 WEEK`，周日数据在下周一零点就满足 `TTL MOVE` 条件。
 
 天分区默认使用 `8 DAY`，目的是保守覆盖最近 `7 * 24h` 的查询窗口。
+
+脚本不会把 `toMonday` 改写成 `toStartOfWeek`，因为 `toStartOfWeek` 默认以星期日作为一周开始，和 `toMonday` 的星期一边界不一致。直接复用 `partition_key` 可以保证冷分层 TTL 和分区边界完全对齐。
+
+对已经执行过旧版本脚本、当前 `TTL` 里已经有冷分层 `TO VOLUME` / `RECOMPRESS` 的表，可以显式使用修复模式重写 TTL。修复模式只处理已经使用目标 `storage_policy` 的表，并保留原有 delete TTL：
+
+```bash
+python3 plan_s3_ttl_tiering.py \
+  --host 127.0.0.1 \
+  --http-port 8123 \
+  --dbs target_db \
+  --repair-existing-tiering-ttl \
+  --execute-alter \
+  --all-batches
+```
 
 ## Batch 语义
 
