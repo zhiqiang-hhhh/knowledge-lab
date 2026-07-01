@@ -74,6 +74,17 @@ python3 plan_s3_ttl_tiering.py \
   --batch-size 10
 ```
 
+默认只处理当前 batch。要一次性处理全部 planned tables，需要显式加 `--all-batches`：
+
+```bash
+python3 plan_s3_ttl_tiering.py \
+  --host 127.0.0.1 \
+  --http-port 8123 \
+  --dbs target_db \
+  --execute-alter \
+  --all-batches
+```
+
 默认每处理 `100` 张候选表会向 stderr 打印一次进度日志，并追加写入当前目录的 `s3_ttl_tiering.log`。可以调小排查卡住的位置：
 
 ```bash

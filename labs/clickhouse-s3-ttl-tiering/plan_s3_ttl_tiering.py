@@ -426,6 +426,8 @@ def write_skip_report(args: argparse.Namespace, skipped: list[SkippedTable]) -> 
     )
 
 def select_batch(args: argparse.Namespace, plans: list[TablePlan]) -> list[TablePlan]:
+    if args.all_batches:
+        return plans
     start = args.batch * args.batch_size
     end = start + args.batch_size
     return plans[start:end]
@@ -675,6 +677,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--codec", default="ZSTD(12)")
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--batch", type=int, default=0)
+    parser.add_argument("--all-batches", action="store_true", help="Process all planned tables instead of only one batch.")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--execute-alter", action="store_true")
     action.add_argument("--execute-materialize", action="store_true")
@@ -742,7 +745,10 @@ def main(argv: list[str]) -> int:
                     f"current={table.database}.{table.name}",
                 )
         batch = select_batch(args, plans)
-        log(args, f"Selected materialize batch {args.batch}: {len(batch)} tables")
+        if args.all_batches:
+            log(args, f"Selected all materialize batches: {len(batch)} tables")
+        else:
+            log(args, f"Selected materialize batch {args.batch}: {len(batch)} tables")
         write_skip_report(args, skipped)
         log(args, f"Wrote materialize skip report under {args.output_dir}")
     else:
@@ -773,7 +779,10 @@ def main(argv: list[str]) -> int:
                     f"current={table.database}.{table.name}",
                 )
         batch = select_batch(args, plans)
-        log(args, f"Selected batch {args.batch}: {len(batch)} tables")
+        if args.all_batches:
+            log(args, f"Selected all batches: {len(batch)} tables")
+        else:
+            log(args, f"Selected batch {args.batch}: {len(batch)} tables")
         write_skip_report(args, skipped)
         log(args, f"Wrote skip report under {args.output_dir}")
 
@@ -783,7 +792,10 @@ def main(argv: list[str]) -> int:
     print_processing_summary(plans)
     start = args.batch * args.batch_size
     end = start + args.batch_size
-    print(f"Batch: {args.batch} ({start}..{max(start, end - 1)}), size {len(batch)}")
+    if args.all_batches:
+        print(f"Batch: all, size {len(batch)}")
+    else:
+        print(f"Batch: {args.batch} ({start}..{max(start, end - 1)}), size {len(batch)}")
     print(f"Output directory: {args.output_dir}")
     print()
 
@@ -806,6 +818,11 @@ def main(argv: list[str]) -> int:
     if args.execute_alter:
         execute_alter_batch(client, batch)
         print("Executed ALTER statements for current batch.")
+        if not args.all_batches and len(plans) > end:
+            print(
+                "More planned tables remain. Re-run with "
+                f"--batch {args.batch + 1} or use --all-batches to process all planned tables."
+            )
     elif args.execute_materialize or args.resume_materialize:
         states = execute_materialize_batch(client, args, batch)
         print("Materialize states:")
@@ -814,6 +831,11 @@ def main(argv: list[str]) -> int:
                 f"  {state.database}.{state.table}: {state.status}, "
                 f"mutation_id={state.mutation_id}, parts_to_do={state.parts_to_do}, "
                 f"latest_fail_reason={state.latest_fail_reason or '-'}"
+            )
+        if args.execute_materialize and not args.all_batches and len(plans) > end:
+            print(
+                "More materialize candidates remain. Re-run with "
+                f"--batch {args.batch + 1} or use --all-batches to process all planned tables."
             )
     else:
         print("Dry-run only. Re-run with --execute-alter to apply ALTER statements for the current batch.")
