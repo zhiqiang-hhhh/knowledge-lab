@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import dataclasses
-import json
 import re
 import sys
 import time
@@ -24,6 +23,8 @@ class TableInfo:
     partition_key: str
     create_table_query: str
     storage_policy: str
+    total_rows: int
+    total_bytes: int
 
 
 @dataclasses.dataclass
@@ -98,9 +99,14 @@ def command(client, query: str) -> None:
 
 
 def log(args: argparse.Namespace, message: str) -> None:
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{now}] {message}"
+    log_file = Path(args.output_dir) / args.log_file
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with log_file.open("a", encoding="utf-8") as out:
+        out.write(line + "\n")
     if not getattr(args, "quiet", False):
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] {message}", file=sys.stderr, flush=True)
+        print(line, file=sys.stderr, flush=True)
 
 
 def char_state_aware_scan(sql: str):
@@ -300,7 +306,9 @@ def fetch_tables(client, args: argparse.Namespace) -> list[TableInfo]:
             engine,
             partition_key,
             create_table_query,
-            storage_policy
+            storage_policy,
+            total_rows,
+            total_bytes
         FROM system.tables
         WHERE {' AND '.join(where)}
         ORDER BY database, name
@@ -314,6 +322,8 @@ def fetch_tables(client, args: argparse.Namespace) -> list[TableInfo]:
             partition_key=row.get("partition_key") or "",
             create_table_query=row.get("create_table_query") or "",
             storage_policy=row.get("storage_policy") or "default",
+            total_rows=int(row.get("total_rows") or 0),
+            total_bytes=int(row.get("total_bytes") or 0),
         )
         for row in rows
     ]
@@ -377,6 +387,26 @@ def build_plan_for_table(
     )
 
 
+def build_materialize_plan_for_table(args: argparse.Namespace, table: TableInfo) -> tuple[TablePlan | None, str | None]:
+    if table.storage_policy != args.target_policy:
+        return None, f"current storage policy is {table.storage_policy}, not {args.target_policy}"
+    create_query = table.create_table_query
+    if not re.search(rf"\bTO\s+VOLUME\s+\\?'{re.escape(args.cold_volume)}\\?'", create_query, flags=re.IGNORECASE):
+        return None, f"TTL does not contain MOVE to volume {args.cold_volume}"
+    if not re.search(r"\bRECOMPRESS\b", create_query, flags=re.IGNORECASE):
+        return None, "TTL does not contain RECOMPRESS"
+
+    return (
+        TablePlan(
+            table=table,
+            move_expr="existing TTL MOVE expression",
+            ttl_delete_entries=[],
+            statements=[],
+        ),
+        None,
+    )
+
+
 def materialize_statement(args: argparse.Namespace, plan: TablePlan) -> str:
     return (
         f"ALTER TABLE {quote_table(plan.table.database, plan.table.name)} "
@@ -384,79 +414,16 @@ def materialize_statement(args: argparse.Namespace, plan: TablePlan) -> str:
     )
 
 
-def write_outputs(args: argparse.Namespace, plans: list[TablePlan], skipped: list[SkippedTable], batch: list[TablePlan]) -> None:
+def write_skip_report(args: argparse.Namespace, skipped: list[SkippedTable]) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    plan_sql = output_dir / f"s3_ttl_tiering_batch_{args.batch}.sql"
-    plan_sql.write_text(
-        "\n\n".join(";\n".join(plan.statements) + ";" for plan in batch) + ("\n" if batch else ""),
-        encoding="utf-8",
-    )
-
-    skipped_tsv = output_dir / "s3_ttl_tiering_skipped.tsv"
+    skipped_tsv = output_dir / args.skip_report
     skipped_tsv.write_text(
         "database\ttable\treason\n"
         + "".join(f"{item.database}\t{item.table}\t{item.reason}\n" for item in skipped),
         encoding="utf-8",
     )
-
-    all_plans_json = output_dir / "s3_ttl_tiering_plans.jsonl"
-    all_plans_json.write_text(
-        "".join(
-            json.dumps(
-                {
-                    "database": plan.table.database,
-                    "table": plan.table.name,
-                    "partition_key": plan.table.partition_key,
-                    "move_expr": plan.move_expr,
-                    "ttl_delete_entries": plan.ttl_delete_entries,
-                    "statements": plan.statements,
-                    "materialize_statement": materialize_statement(args, plan),
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-            for plan in plans
-        ),
-        encoding="utf-8",
-    )
-
-    if args.write_materialize_sql:
-        materialize_sql = output_dir / f"s3_ttl_tiering_materialize_batch_{args.batch}.sql"
-        materialize_sql.write_text(
-            "\n".join(materialize_statement(args, plan) + ";" for plan in batch) + ("\n" if batch else ""),
-            encoding="utf-8",
-        )
-
-
-def load_saved_plans(args: argparse.Namespace) -> list[TablePlan]:
-    path = Path(args.output_dir) / "s3_ttl_tiering_plans.jsonl"
-    if not path.exists():
-        raise RuntimeError(f"plan file does not exist: {path}; run plan/alter stage first")
-    plans = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        table = TableInfo(
-            database=row["database"],
-            name=row["table"],
-            engine="",
-            partition_key=row.get("partition_key", ""),
-            create_table_query="",
-            storage_policy=args.target_policy,
-        )
-        plans.append(
-            TablePlan(
-                table=table,
-                move_expr=row.get("move_expr", ""),
-                ttl_delete_entries=row.get("ttl_delete_entries", []),
-                statements=row.get("statements", []),
-            )
-        )
-    return plans
-
 
 def select_batch(args: argparse.Namespace, plans: list[TablePlan]) -> list[TablePlan]:
     start = args.batch * args.batch_size
@@ -464,15 +431,48 @@ def select_batch(args: argparse.Namespace, plans: list[TablePlan]) -> list[Table
     return plans[start:end]
 
 
+def format_readable_size(size: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def print_processing_summary(plans: list[TablePlan]) -> None:
+    by_db: dict[str, list[TablePlan]] = {}
+    for plan in plans:
+        by_db.setdefault(plan.table.database, []).append(plan)
+
+    total_rows = sum(plan.table.total_rows for plan in plans)
+    total_bytes = sum(plan.table.total_bytes for plan in plans)
+    print(
+        "Processing summary: "
+        f"databases={len(by_db)}, tables={len(plans)}, rows={total_rows}, "
+        f"size={format_readable_size(total_bytes)}"
+    )
+    if not by_db:
+        return
+
+    print("Database processing order:")
+    for index, database in enumerate(sorted(by_db), start=1):
+        db_plans = by_db[database]
+        db_rows = sum(plan.table.total_rows for plan in db_plans)
+        db_bytes = sum(plan.table.total_bytes for plan in db_plans)
+        print(
+            f"  {index}. {database}: tables={len(db_plans)}, rows={db_rows}, "
+            f"size={format_readable_size(db_bytes)}"
+        )
+    print()
+
+
 def execute_alter_batch(client, batch: list[TablePlan]) -> None:
     for plan in batch:
         print(f"Executing {plan.table.database}.{plan.table.name}", flush=True)
         for statement in plan.statements:
             command(client, statement)
-
-
-def mutation_state_path(args: argparse.Namespace) -> Path:
-    return Path(args.output_dir) / f"s3_ttl_tiering_materialize_state_batch_{args.batch}.jsonl"
 
 
 def mutation_status(row: dict) -> str:
@@ -542,26 +542,6 @@ def pending_materialize_mutation(client, database: str, table: str) -> MutationS
     return states[0] if states else None
 
 
-def write_mutation_states(args: argparse.Namespace, states: list[MutationState]) -> None:
-    output = mutation_state_path(args)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        "".join(json.dumps(dataclasses.asdict(state), ensure_ascii=False) + "\n" for state in states),
-        encoding="utf-8",
-    )
-
-
-def read_mutation_states(args: argparse.Namespace) -> list[MutationState]:
-    path = mutation_state_path(args)
-    if not path.exists():
-        raise RuntimeError(f"mutation state file does not exist: {path}")
-    states = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            states.append(MutationState(**json.loads(line)))
-    return states
-
-
 def submit_materialize(client, args: argparse.Namespace, plan: TablePlan) -> MutationState:
     database = plan.table.database
     table = plan.table.name
@@ -610,7 +590,6 @@ def wait_for_materialize(client, args: argparse.Namespace, states: list[Mutation
     current = states
     while True:
         current = refresh_materialize_states(client, current)
-        write_mutation_states(args, current)
         unfinished = [state for state in current if state.status == "queued"]
         if not unfinished:
             log(args, "All MATERIALIZE TTL mutations finished")
@@ -629,18 +608,53 @@ def wait_for_materialize(client, args: argparse.Namespace, states: list[Mutation
         time.sleep(args.materialize_poll_seconds)
 
 
+def fetch_pending_materialize_states(client, args: argparse.Namespace) -> list[MutationState]:
+    included = set(split_csv(args.dbs))
+    excluded = SYSTEM_DATABASES | set(split_csv(args.dbs_exclude))
+
+    filters = ["command LIKE '%MATERIALIZE TTL%'", "is_done = 0"]
+    if included:
+        filters.append("database IN (" + ", ".join(quote_literal(db) for db in sorted(included)) + ")")
+    if excluded:
+        filters.append("database NOT IN (" + ", ".join(quote_literal(db) for db in sorted(excluded)) + ")")
+
+    rows = query_rows(
+        client,
+        f"""
+        SELECT
+            database,
+            table,
+            mutation_id,
+            command,
+            toString(create_time) AS create_time,
+            is_done,
+            latest_fail_reason,
+            parts_to_do
+        FROM system.mutations
+        WHERE {' AND '.join(filters)}
+        ORDER BY database, table, create_time DESC, mutation_id DESC
+        """,
+    )
+    return [
+        row_to_mutation_state(
+            str(row.get("database") or ""),
+            str(row.get("table") or ""),
+            row,
+        )
+        for row in rows
+    ]
+
+
 def execute_materialize_batch(client, args: argparse.Namespace, batch: list[TablePlan]) -> list[MutationState]:
     if args.resume_materialize:
-        log(args, "Reading saved MATERIALIZE TTL mutation state")
-        states = read_mutation_states(args)
+        log(args, "Scanning system.mutations for pending MATERIALIZE TTL mutations")
+        states = fetch_pending_materialize_states(client, args)
     else:
         log(args, f"Submitting MATERIALIZE TTL for {len(batch)} tables")
         states = [submit_materialize(client, args, plan) for plan in batch]
-    write_mutation_states(args, states)
     if args.wait_materialize:
         log(args, f"Polling MATERIALIZE TTL state for up to {args.materialize_timeout_seconds} seconds")
         states = wait_for_materialize(client, args, states)
-        write_mutation_states(args, states)
     return states
 
 
@@ -665,8 +679,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     action.add_argument("--execute-alter", action="store_true")
     action.add_argument("--execute-materialize", action="store_true")
     action.add_argument("--resume-materialize", action="store_true")
-    parser.add_argument("--output-dir", default="tmp")
-    parser.add_argument("--write-materialize-sql", action="store_true")
+    parser.add_argument("--output-dir", default=".", help="Directory for run log and skip report.")
+    parser.add_argument("--log-file", default="s3_ttl_tiering.log")
+    parser.add_argument("--skip-report", default="s3_ttl_tiering_skipped.tsv")
     parser.add_argument("--time-column", help="Override inferred time expression with this column name.")
     parser.add_argument("--weekly-hot-weeks", type=int, default=2)
     parser.add_argument("--daily-hot-days", type=int, default=8)
@@ -705,14 +720,31 @@ def main(argv: list[str]) -> int:
     scanned_tables = 0
     skipped: list[SkippedTable] = []
     if args.resume_materialize:
-        log(args, "Resuming MATERIALIZE TTL state polling from saved state file")
+        log(args, "Resuming MATERIALIZE TTL state polling from system.mutations")
         plans = []
         batch = []
     elif args.execute_materialize:
-        log(args, "Loading saved table plan for MATERIALIZE TTL stage")
-        plans = load_saved_plans(args)
+        log(args, "Fetching candidate MergeTree tables for MATERIALIZE TTL stage")
+        tables = fetch_tables(client, args)
+        scanned_tables = len(tables)
+        plans = []
+        for index, table in enumerate(tables, start=1):
+            plan, reason = build_materialize_plan_for_table(args, table)
+            if plan:
+                plans.append(plan)
+            else:
+                skipped.append(SkippedTable(table.database, table.name, reason or "unknown reason"))
+            if args.log_every and (index == 1 or index % args.log_every == 0 or index == len(tables)):
+                log(
+                    args,
+                    "Processed "
+                    f"{index}/{len(tables)} tables for materialize; planned={len(plans)}, skipped={len(skipped)}, "
+                    f"current={table.database}.{table.name}",
+                )
         batch = select_batch(args, plans)
-        scanned_tables = len(plans)
+        log(args, f"Selected materialize batch {args.batch}: {len(batch)} tables")
+        write_skip_report(args, skipped)
+        log(args, f"Wrote materialize skip report under {args.output_dir}")
     else:
         log(args, "Fetching storage policy metadata")
         policies = fetch_storage_policies(client)
@@ -742,12 +774,13 @@ def main(argv: list[str]) -> int:
                 )
         batch = select_batch(args, plans)
         log(args, f"Selected batch {args.batch}: {len(batch)} tables")
-        write_outputs(args, plans, skipped, batch)
-        log(args, f"Wrote plan outputs under {args.output_dir}")
+        write_skip_report(args, skipped)
+        log(args, f"Wrote skip report under {args.output_dir}")
 
     print(f"Scanned tables: {scanned_tables}")
     print(f"Planned tables: {len(plans)}")
     print(f"Skipped tables: {len(skipped)}")
+    print_processing_summary(plans)
     start = args.batch * args.batch_size
     end = start + args.batch_size
     print(f"Batch: {args.batch} ({start}..{max(start, end - 1)}), size {len(batch)}")
@@ -757,10 +790,14 @@ def main(argv: list[str]) -> int:
     for index, plan in enumerate(batch, start=start + 1):
         print(f"[{index}] {plan.table.database}.{plan.table.name}")
         print(f"    partition_key: {plan.table.partition_key}")
-        print(f"    move/recompress: {plan.move_expr}")
-        print("    ALTER plan:")
-        for statement in plan.statements:
-            print("      " + statement.replace("\n", "\n      "))
+        if args.execute_materialize:
+            print("    MATERIALIZE plan:")
+            print("      " + materialize_statement(args, plan))
+        else:
+            print(f"    move/recompress: {plan.move_expr}")
+            print("    ALTER plan:")
+            for statement in plan.statements:
+                print("      " + statement.replace("\n", "\n      "))
         print()
 
     if args.execute_alter:
@@ -780,7 +817,7 @@ def main(argv: list[str]) -> int:
         print("Use --execute-materialize only after ALTER has been reviewed/applied.")
 
     if skipped:
-        print(f"Skipped table report: {Path(args.output_dir) / 's3_ttl_tiering_skipped.tsv'}")
+        print(f"Skipped table report: {Path(args.output_dir) / args.skip_report}")
     return 0
 
 

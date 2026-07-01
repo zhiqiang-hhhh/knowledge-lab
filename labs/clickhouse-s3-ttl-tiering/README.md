@@ -11,7 +11,7 @@
 脚本把迁移拆成三个阶段：
 
 1. `plan`
-   默认模式，只扫描表、生成当前 batch 的 `ALTER` 计划和 skip report，不执行写操作。
+   默认模式，只扫描表、打印当前 batch 的 `ALTER` 计划和 skip report，不执行写操作。脚本不持久化 `ALTER` plan，每次运行都从 `system.tables` 当前状态重新计算。
 
 2. `alter`
    通过 `--execute-alter` 执行当前 batch 的 metadata 变更：
@@ -35,7 +35,7 @@
    ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 0;
    ```
 
-`MATERIALIZE TTL` 阶段读取之前写入的 `s3_ttl_tiering_plans.jsonl`，不会重新按当前表的 `TTL` 做候选筛选。原因是 `alter` 后表上已经包含 `MOVE` 和 `RECOMPRESS` 规则，如果重新筛选会被复杂 `TTL` 保护规则跳过。
+`MATERIALIZE TTL` 阶段也是无状态的：脚本重新扫描当前表状态，只选择已经使用目标 `storage_policy`，并且当前 `TTL` 里已经包含 `TO VOLUME 'cold'` 和 `RECOMPRESS` 的表。`--resume-materialize` 不读取本地 state file，而是直接从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation。
 
 ## TTL 保护规则
 
@@ -64,7 +64,7 @@
 
 `--dbs` 非必填，默认扫描所有非系统库。`--dbs-exclude` 可以显式排除库。脚本不会在 SQL 里使用 `LIMIT` 或 `OFFSET`，而是在 Python 内部对候选表排序并切 batch。
 
-默认 batch size 是 `10`：
+默认 batch size 是 `10`。脚本会在扫描完成后打印汇总：需要处理的 database 数、table 数、总行数、总 size，以及按 database 排序的处理顺序：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -74,7 +74,7 @@ python3 plan_s3_ttl_tiering.py \
   --batch-size 10
 ```
 
-默认每处理 `100` 张候选表会向 stderr 打印一次进度日志。可以调小排查卡住的位置：
+默认每处理 `100` 张候选表会向 stderr 打印一次进度日志，并追加写入当前目录的 `s3_ttl_tiering.log`。可以调小排查卡住的位置：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -102,8 +102,7 @@ python3 plan_s3_ttl_tiering.py \
   --dbs target_db \
   --target-policy s3_tier \
   --cold-volume cold \
-  --output-dir tmp/s3_ttl_tiering \
-  --write-materialize-sql
+  --output-dir .
 ```
 
 执行当前 batch 的 `ALTER`：
@@ -115,7 +114,7 @@ python3 plan_s3_ttl_tiering.py \
   --dbs target_db \
   --target-policy s3_tier \
   --cold-volume cold \
-  --output-dir tmp/s3_ttl_tiering \
+  --output-dir . \
   --execute-alter
 ```
 
@@ -127,7 +126,7 @@ python3 plan_s3_ttl_tiering.py \
   --http-port 8123 \
   --target-policy s3_tier \
   --cold-volume cold \
-  --output-dir tmp/s3_ttl_tiering \
+  --output-dir . \
   --execute-materialize \
   --mutations-sync 0
 ```
@@ -140,7 +139,7 @@ python3 plan_s3_ttl_tiering.py \
   --http-port 8123 \
   --target-policy s3_tier \
   --cold-volume cold \
-  --output-dir tmp/s3_ttl_tiering \
+  --output-dir . \
   --execute-materialize \
   --mutations-sync 0 \
   --wait-materialize \
@@ -153,20 +152,17 @@ python3 plan_s3_ttl_tiering.py \
 python3 plan_s3_ttl_tiering.py \
   --host 127.0.0.1 \
   --http-port 8123 \
-  --output-dir tmp/s3_ttl_tiering \
+  --output-dir . \
   --resume-materialize \
   --wait-materialize
 ```
 
 ## 输出文件
 
-脚本会在 `--output-dir` 下写入：
+脚本保持无状态，不持久化 `ALTER` plan 或 `MATERIALIZE TTL` state。脚本只在 `--output-dir` 下写入运行日志和 skip report：
 
-- `s3_ttl_tiering_batch_<n>.sql`：当前 batch 的 `ALTER` SQL。
-- `s3_ttl_tiering_plans.jsonl`：全部可迁移表的结构化计划。
+- `s3_ttl_tiering.log`：运行进度日志。
 - `s3_ttl_tiering_skipped.tsv`：跳过表和原因。
-- `s3_ttl_tiering_materialize_batch_<n>.sql`：只有传入 `--write-materialize-sql` 时生成。
-- `s3_ttl_tiering_materialize_state_batch_<n>.jsonl`：`MATERIALIZE TTL` mutation 状态。
 
 `MATERIALIZE TTL` 状态包括：
 
