@@ -13,6 +13,7 @@ except ModuleNotFoundError:
 
 
 SYSTEM_DATABASES = {"system", "INFORMATION_SCHEMA", "information_schema"}
+MODES = {"plan", "apply-policy", "apply-ttl", "materialize", "resume-materialize"}
 
 
 @dataclasses.dataclass
@@ -389,13 +390,22 @@ def build_plan_for_table(
     policy_volumes: dict[str, set[str]],
     table: TableInfo,
 ) -> tuple[TablePlan | None, str | None]:
+    if args.mode == "apply-ttl" and table.storage_policy != args.target_policy:
+        return None, (
+            f"apply-ttl requires current storage policy {args.target_policy}; "
+            f"current policy is {table.storage_policy}. Run apply-policy on this replica first"
+        )
+
     repair_existing_ttl = bool(args.repair_existing_tiering_ttl and table.storage_policy == args.target_policy)
     if args.repair_existing_tiering_ttl and table.storage_policy != args.target_policy:
         return None, (
             "repair mode only handles tables already using storage policy "
             f"{args.target_policy}; current policy is {table.storage_policy}"
         )
-    if table.storage_policy == args.target_policy and not (args.allow_already_policy or repair_existing_ttl):
+    if (
+        table.storage_policy == args.target_policy
+        and not (args.allow_already_policy or repair_existing_ttl or args.mode == "apply-ttl")
+    ):
         return None, f"already uses storage policy {args.target_policy}"
     if table.storage_policy not in {"default", args.target_policy} and not args.allow_non_default_policy:
         return None, f"current storage policy is {table.storage_policy}, not default"
@@ -495,6 +505,14 @@ def materialize_statement(args: argparse.Namespace, plan: TablePlan) -> str:
     )
 
 
+def policy_statement(plan: TablePlan) -> str:
+    return plan.statements[0]
+
+
+def ttl_statement(plan: TablePlan) -> str:
+    return plan.statements[1]
+
+
 def write_skip_report(args: argparse.Namespace, skipped: list[SkippedTable]) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -582,11 +600,16 @@ def print_entries(indent: str, entries: list[str]) -> None:
         print(f"{indent}{entry}")
 
 
-def execute_alter_batch(client, batch: list[TablePlan]) -> None:
+def execute_policy_batch(client, batch: list[TablePlan]) -> None:
     for plan in batch:
-        print(f"Executing {plan.table.database}.{plan.table.name}", flush=True)
-        for statement in plan.statements:
-            command(client, statement)
+        print(f"Applying local storage_policy {plan.table.database}.{plan.table.name}", flush=True)
+        command(client, policy_statement(plan))
+
+
+def execute_ttl_batch(client, batch: list[TablePlan]) -> None:
+    for plan in batch:
+        print(f"Applying replicated TTL {plan.table.database}.{plan.table.name}", flush=True)
+        command(client, ttl_statement(plan))
 
 
 def mutation_status(row: dict) -> str:
@@ -783,7 +806,7 @@ def fetch_pending_materialize_states(client, args: argparse.Namespace) -> list[M
 
 
 def execute_materialize_batch(client, args: argparse.Namespace, batch: list[TablePlan]) -> list[MutationState]:
-    if args.resume_materialize:
+    if args.mode == "resume-materialize":
         log(args, "Scanning system.mutations for pending MATERIALIZE TTL mutations")
         states = fetch_pending_materialize_states(client, args)
     else:
@@ -836,10 +859,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--batch", type=int, default=0)
     parser.add_argument("--all-batches", action="store_true", help="Process all planned tables instead of only one batch.")
+    parser.add_argument(
+        "--mode",
+        choices=sorted(MODES),
+        default="plan",
+        help=(
+            "Execution mode. plan is dry-run; apply-policy applies local storage_policy; "
+            "apply-ttl submits replicated TTL metadata ALTER; materialize submits MATERIALIZE TTL; "
+            "resume-materialize only watches existing MATERIALIZE TTL mutations."
+        ),
+    )
     action = parser.add_mutually_exclusive_group()
-    action.add_argument("--execute-alter", action="store_true")
-    action.add_argument("--execute-materialize", action="store_true")
-    action.add_argument("--resume-materialize", action="store_true")
+    action.add_argument("--execute-alter", action="store_true", help=argparse.SUPPRESS)
+    action.add_argument("--execute-materialize", action="store_true", help=argparse.SUPPRESS)
+    action.add_argument("--resume-materialize", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output-dir", default=".", help="Directory for run log and skip report.")
     parser.add_argument("--log-file", default="s3_ttl_tiering.log")
     parser.add_argument("--skip-report", default="s3_ttl_tiering_skipped.tsv")
@@ -872,6 +905,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     args = parser.parse_args(argv)
+    mode_explicit = "--mode" in argv or any(item.startswith("--mode=") for item in argv)
+    if args.execute_alter:
+        parser.error(
+            "--execute-alter is deprecated and unsafe for ReplicatedMergeTree; "
+            "run --mode apply-policy on every target replica, then --mode apply-ttl once per replica group"
+        )
+    if args.execute_materialize:
+        if mode_explicit and args.mode != "materialize":
+            parser.error("--execute-materialize conflicts with --mode; use --mode materialize")
+        args.mode = "materialize"
+    if args.resume_materialize:
+        if mode_explicit and args.mode != "resume-materialize":
+            parser.error("--resume-materialize conflicts with --mode; use --mode resume-materialize")
+        args.mode = "resume-materialize"
+
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     if args.batch < 0:
@@ -899,11 +947,11 @@ def main(argv: list[str]) -> int:
 
     scanned_tables = 0
     skipped: list[SkippedTable] = []
-    if args.resume_materialize:
+    if args.mode == "resume-materialize":
         log(args, "Resuming MATERIALIZE TTL state polling from system.mutations")
         plans = []
         batch = []
-    elif args.execute_materialize:
+    elif args.mode == "materialize":
         log(args, "Fetching candidate MergeTree tables for MATERIALIZE TTL stage")
         tables = fetch_tables(client, args)
         scanned_tables = len(tables)
@@ -965,6 +1013,7 @@ def main(argv: list[str]) -> int:
         write_skip_report(args, skipped)
         log(args, f"Wrote skip report under {args.output_dir}")
 
+    print(f"Mode: {args.mode}")
     print(f"Scanned tables: {scanned_tables}")
     print(f"Planned tables: {len(plans)}")
     print(f"Skipped tables: {len(skipped)}")
@@ -981,7 +1030,7 @@ def main(argv: list[str]) -> int:
     for index, plan in enumerate(batch, start=start + 1):
         print(f"[{index}] {plan.table.database}.{plan.table.name}")
         print(f"    partition_key: {plan.table.partition_key}")
-        if args.execute_materialize:
+        if args.mode == "materialize":
             print("    MATERIALIZE plan:")
             print("      " + materialize_statement(args, plan))
         else:
@@ -1002,20 +1051,36 @@ def main(argv: list[str]) -> int:
             print(f"      TTL RECOMPRESS: {plan.move_expr} RECOMPRESS CODEC({args.codec})")
             print("      TTL DELETE:")
             print_entries("        ", plan.ttl_delete_entries)
-            print("    ALTER statements:")
-            for statement in plan.statements:
-                print("      " + statement.replace("\n", "\n      "))
+            print("    planned statements:")
+            print("      local policy:")
+            print("        " + policy_statement(plan))
+            print("      replicated TTL:")
+            print("        " + ttl_statement(plan).replace("\n", "\n        "))
         print()
 
-    if args.execute_alter:
-        execute_alter_batch(client, batch)
-        print("Executed ALTER statements for current batch.")
+    if args.mode == "apply-policy":
+        if batch:
+            execute_policy_batch(client, batch)
+            print("Executed local storage_policy ALTER statements for current batch.")
+        else:
+            print("No local storage_policy ALTER statements to execute for current batch.")
         if not args.all_batches and len(plans) > end:
             print(
                 "More planned tables remain. Re-run with "
                 f"--batch {args.batch + 1} or use --all-batches to process all planned tables."
             )
-    elif args.execute_materialize or args.resume_materialize:
+    elif args.mode == "apply-ttl":
+        if batch:
+            execute_ttl_batch(client, batch)
+            print("Executed replicated TTL ALTER statements for current batch.")
+        else:
+            print("No replicated TTL ALTER statements to execute for current batch.")
+        if not args.all_batches and len(plans) > end:
+            print(
+                "More planned tables remain. Re-run with "
+                f"--batch {args.batch + 1} or use --all-batches to process all planned tables."
+            )
+    elif args.mode in {"materialize", "resume-materialize"}:
         states = execute_materialize_batch(client, args, batch)
         print("Materialize states:")
         for state in states:
@@ -1024,14 +1089,15 @@ def main(argv: list[str]) -> int:
                 f"mutation_id={state.mutation_id}, parts_to_do={state.parts_to_do}, "
                 f"latest_fail_reason={state.latest_fail_reason or '-'}"
             )
-        if args.execute_materialize and not args.all_batches and len(plans) > end:
+        if args.mode == "materialize" and not args.all_batches and len(plans) > end:
             print(
                 "More materialize candidates remain. Re-run with "
                 f"--batch {args.batch + 1} or use --all-batches to process all planned tables."
             )
     else:
-        print("Dry-run only. Re-run with --execute-alter to apply ALTER statements for the current batch.")
-        print("Use --execute-materialize only after ALTER has been reviewed/applied.")
+        print("Dry-run only.")
+        print("Run --mode apply-policy on every target replica, then --mode apply-ttl once per replica group.")
+        print("Use --mode materialize only after TTL ALTER has been reviewed/applied and replica metadata is aligned.")
 
     if skipped:
         print(f"Skipped table report: {Path(args.output_dir) / args.skip_report}")

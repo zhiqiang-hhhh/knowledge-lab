@@ -6,19 +6,26 @@
 
 在用户无感的情况下，用 `S3` 作为冷数据底层存储，降低本地盘成本。实验方案不把新写入数据直接写入 `S3`，而是让新数据继续写入本地热 volume；超过热数据窗口后，通过 `TTL MOVE` 和 `TTL RECOMPRESS` 把冷数据移动到 `cold` volume。
 
-## 三阶段执行模型
+## 执行模型
 
-脚本把迁移拆成三个阶段：
+脚本把迁移拆成几个显式 `--mode`。这是为了区分 `ReplicatedMergeTree` 里“每个 replica 都要本地执行”的 table setting，以及“同一个 replica group 只提交一次”的 replicated metadata / mutation。
 
 1. `plan`
-   默认模式，只扫描表、打印当前 batch 的 `ALTER` 计划和 skip report，不执行写操作。脚本不持久化 `ALTER` plan，每次运行都从 `system.tables` 当前状态重新计算。
+   默认模式，只扫描表、打印当前 batch 的计划和 skip report，不执行写操作。脚本不持久化 `ALTER` plan，每次运行都从 `system.tables` 当前状态重新计算。
 
-2. `alter`
-   通过 `--execute-alter` 执行当前 batch 的 metadata 变更：
+2. `apply-policy`
+   只执行本地 `storage_policy` setting：
 
    ```sql
    ALTER TABLE db.table MODIFY SETTING storage_policy = 's3_tier';
+   ```
 
+   这一步对 `ReplicatedMergeTree` 不会自动同步到其他 replica，因此目标 shard 内每个目标 replica 都要执行一次。
+
+3. `apply-ttl`
+   只提交 replicated TTL metadata alter：
+
+   ```sql
    ALTER TABLE db.table MODIFY TTL
        <move_expr> TO VOLUME 'cold',
        <move_expr> RECOMPRESS CODEC(ZSTD(12)),
@@ -26,16 +33,19 @@
    SETTINGS materialize_ttl_after_modify = 0;
    ```
 
-   这一步不会触发历史数据搬迁。
+   这一步同一个 `ReplicatedMergeTree` replica group 只提交一次，其他 replica 通过 replication log 自动应用。它不会触发历史数据搬迁。
 
-3. `materialize`
-   通过 `--execute-materialize` 单独提交当前 batch 的 `MATERIALIZE TTL` mutation。默认使用 `mutations_sync = 2`，同步等待当前节点执行完成。
+4. `materialize`
+   单独提交当前 batch 的 `MATERIALIZE TTL` mutation。默认使用 `mutations_sync = 2`，同步等待所有 replica 完成。
 
    ```sql
    ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 2;
    ```
 
-`MATERIALIZE TTL` 阶段也是无状态的：脚本重新扫描当前表状态，只选择已经使用目标 `storage_policy`，并且当前 `TTL` 里已经包含 `TO VOLUME 'cold'` 和 `RECOMPRESS` 的表。`--resume-materialize` 不读取本地 state file，而是直接从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation。
+5. `resume-materialize`
+   不提交新的 mutation，只从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation 并继续观察。
+
+`MATERIALIZE TTL` 阶段也是无状态的：脚本重新扫描当前表状态，只选择已经使用目标 `storage_policy`，并且当前 `TTL` 里已经包含 `TO VOLUME 'cold'` 和 `RECOMPRESS` 的表。`resume-materialize` 不读取本地 state file，而是直接从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation。
 
 ## TTL 保护规则
 
@@ -70,7 +80,7 @@ python3 plan_s3_ttl_tiering.py \
   --http-port 8123 \
   --dbs target_db \
   --repair-existing-tiering-ttl \
-  --execute-alter \
+  --mode apply-ttl \
   --all-batches
 ```
 
@@ -116,7 +126,7 @@ python3 plan_s3_ttl_tiering.py \
   --host 127.0.0.1 \
   --http-port 8123 \
   --dbs target_db \
-  --execute-alter \
+  --mode apply-policy \
   --all-batches
 ```
 
@@ -151,7 +161,7 @@ python3 plan_s3_ttl_tiering.py \
   --output-dir .
 ```
 
-执行当前 batch 的 `ALTER`：
+在每个目标 replica 上执行当前 batch 的本地 `storage_policy`：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -161,10 +171,23 @@ python3 plan_s3_ttl_tiering.py \
   --target-policy s3_tier \
   --cold-volume cold \
   --output-dir . \
-  --execute-alter
+  --mode apply-policy
 ```
 
-提交当前 batch 的 `MATERIALIZE TTL`，默认同步等待当前节点执行完成：
+在一个 replica 上提交当前 batch 的 replicated `TTL` metadata alter：
+
+```bash
+python3 plan_s3_ttl_tiering.py \
+  --host 127.0.0.1 \
+  --http-port 8123 \
+  --dbs target_db \
+  --target-policy s3_tier \
+  --cold-volume cold \
+  --output-dir . \
+  --mode apply-ttl
+```
+
+提交当前 batch 的 `MATERIALIZE TTL`，默认同步等待所有 replica 完成：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -173,7 +196,7 @@ python3 plan_s3_ttl_tiering.py \
   --target-policy s3_tier \
   --cold-volume cold \
   --output-dir . \
-  --execute-materialize
+  --mode materialize
 ```
 
 需要异步提交时，显式设置 `--mutations-sync 0`：
@@ -185,7 +208,7 @@ python3 plan_s3_ttl_tiering.py \
   --target-policy s3_tier \
   --cold-volume cold \
   --output-dir . \
-  --execute-materialize \
+  --mode materialize \
   --mutations-sync 0
 ```
 
@@ -197,7 +220,7 @@ python3 plan_s3_ttl_tiering.py \
   --http-port 8123 \
   --target-policy s3_tier \
   --cold-volume cold \
-  --execute-materialize \
+  --mode materialize \
   --mutations-sync 0 \
   --max-pending-materialize 3
 ```
@@ -211,7 +234,7 @@ python3 plan_s3_ttl_tiering.py \
   --target-policy s3_tier \
   --cold-volume cold \
   --output-dir . \
-  --execute-materialize \
+  --mode materialize \
   --mutations-sync 0 \
   --wait-materialize \
   --materialize-timeout-seconds 3600
@@ -224,7 +247,7 @@ python3 plan_s3_ttl_tiering.py \
   --host 127.0.0.1 \
   --http-port 8123 \
   --output-dir . \
-  --resume-materialize \
+  --mode resume-materialize \
   --wait-materialize
 ```
 
@@ -245,7 +268,11 @@ python3 plan_s3_ttl_tiering.py \
 
 ## ReplicatedMergeTree 约束
 
-对 `ReplicatedMergeTree`，不要在两个 replica 上都执行同一批 `ALTER` 或 `MATERIALIZE TTL`。metadata `ALTER` 和 mutation 都会进入 replication log；在一个 replica 提交后，其他 replica 会自动 apply。
+对 `ReplicatedMergeTree`，`MODIFY SETTING storage_policy` 和 `MODIFY TTL` 的同步语义不同：
+
+- `MODIFY SETTING storage_policy` 是本地 table setting，不会进入 replicated metadata log；目标 shard 内每个目标 replica 都要执行 `--mode apply-policy`。
+- `MODIFY TTL` 是 replicated metadata alter，会进入 `ALTER_METADATA` log；同一个 replica group 只执行一次 `--mode apply-ttl`。
+- `MATERIALIZE TTL` 是 mutation，会进入 `/mutations`；同一个 replica group 只执行一次 `--mode materialize`。
 
 如果两个 replica 都提交同一个 `MATERIALIZE TTL`，会产生两个独立 mutation，增加 mutation queue、后台 IO 和对象存储请求。脚本只连接一个目标 `ClickHouse` 节点，不使用 `clusterAllReplicas` 执行写操作。
 
