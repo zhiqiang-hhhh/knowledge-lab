@@ -393,7 +393,8 @@ def build_plan_for_table(
     if args.mode == "apply-ttl" and table.storage_policy != args.target_policy:
         return None, (
             f"apply-ttl requires current storage policy {args.target_policy}; "
-            f"current policy is {table.storage_policy}. Run apply-policy on this replica first"
+            f"current policy is {table.storage_policy}. Run apply-policy for this replica group first "
+            "and wait until this replica applies the metadata"
         )
 
     repair_existing_ttl = bool(args.repair_existing_tiering_ttl and table.storage_policy == args.target_policy)
@@ -602,7 +603,7 @@ def print_entries(indent: str, entries: list[str]) -> None:
 
 def execute_policy_batch(client, batch: list[TablePlan]) -> None:
     for plan in batch:
-        print(f"Applying local storage_policy {plan.table.database}.{plan.table.name}", flush=True)
+        print(f"Applying storage_policy ALTER {plan.table.database}.{plan.table.name}", flush=True)
         command(client, policy_statement(plan))
 
 
@@ -864,7 +865,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=sorted(MODES),
         default="plan",
         help=(
-            "Execution mode. plan is dry-run; apply-policy applies local storage_policy; "
+            "Execution mode. plan is dry-run; apply-policy submits storage_policy metadata ALTER; "
             "apply-ttl submits replicated TTL metadata ALTER; materialize submits MATERIALIZE TTL; "
             "resume-materialize only watches existing MATERIALIZE TTL mutations."
         ),
@@ -882,7 +883,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--weekly-hot-weeks", type=int, default=2)
     parser.add_argument("--daily-hot-days", type=int, default=8)
-    parser.add_argument("--mutations-sync", type=int, default=2)
+    parser.add_argument("--mutations-sync", type=int, default=1)
     parser.add_argument("--wait-materialize", action="store_true")
     parser.add_argument(
         "--max-pending-materialize",
@@ -909,7 +910,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.execute_alter:
         parser.error(
             "--execute-alter is deprecated and unsafe for ReplicatedMergeTree; "
-            "run --mode apply-policy on every target replica, then --mode apply-ttl once per replica group"
+            "run --mode apply-policy once per replica group, wait for metadata alignment, "
+            "then run --mode apply-ttl once per replica group"
         )
     if args.execute_materialize:
         if mode_explicit and args.mode != "materialize":
@@ -1061,9 +1063,9 @@ def main(argv: list[str]) -> int:
     if args.mode == "apply-policy":
         if batch:
             execute_policy_batch(client, batch)
-            print("Executed local storage_policy ALTER statements for current batch.")
+            print("Executed storage_policy ALTER statements for current batch.")
         else:
-            print("No local storage_policy ALTER statements to execute for current batch.")
+            print("No storage_policy ALTER statements to execute for current batch.")
         if not args.all_batches and len(plans) > end:
             print(
                 "More planned tables remain. Re-run with "
@@ -1096,7 +1098,7 @@ def main(argv: list[str]) -> int:
             )
     else:
         print("Dry-run only.")
-        print("Run --mode apply-policy on every target replica, then --mode apply-ttl once per replica group.")
+        print("Run --mode apply-policy once per replica group, then --mode apply-ttl once per replica group.")
         print("Use --mode materialize only after TTL ALTER has been reviewed/applied and replica metadata is aligned.")
 
     if skipped:

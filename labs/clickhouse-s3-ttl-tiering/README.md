@@ -8,19 +8,19 @@
 
 ## 执行模型
 
-脚本把迁移拆成几个显式 `--mode`。这是为了区分 `ReplicatedMergeTree` 里“每个 replica 都要本地执行”的 table setting，以及“同一个 replica group 只提交一次”的 replicated metadata / mutation。
+脚本把迁移拆成几个显式阶段。对 `ReplicatedMergeTree`，metadata `ALTER` 和 `MATERIALIZE TTL` 都只在同一个 replica group 中提交一次；其他 active replicas 通过 replication log 应用同一份 metadata 或 mutation。
 
 1. `plan`
    默认模式，只扫描表、打印当前 batch 的计划和 skip report，不执行写操作。脚本不持久化 `ALTER` plan，每次运行都从 `system.tables` 当前状态重新计算。
 
 2. `apply-policy`
-   只执行本地 `storage_policy` setting：
+   执行 `storage_policy` setting：
 
    ```sql
    ALTER TABLE db.table MODIFY SETTING storage_policy = 's3_tier';
    ```
 
-   这一步对 `ReplicatedMergeTree` 不会自动同步到其他 replica，因此目标 shard 内每个目标 replica 都要执行一次。
+   这一步对同一个 `ReplicatedMergeTree` replica group 只提交一次。目标 replica group 内每个 active replica 都必须已经配置好目标 storage policy，否则应用 metadata 或后续读写 part 时会失败。
 
 3. `apply-ttl`
    只提交 replicated TTL metadata alter：
@@ -36,10 +36,10 @@
    这一步同一个 `ReplicatedMergeTree` replica group 只提交一次，其他 replica 通过 replication log 自动应用。它不会触发历史数据搬迁。
 
 4. `materialize`
-   单独提交当前 batch 的 `MATERIALIZE TTL` mutation。默认使用 `mutations_sync = 2`，同步等待所有 replica 完成。
+   单独提交当前 batch 的 `MATERIALIZE TTL` mutation。默认使用 `mutations_sync = 1`，同步等待当前 replica 完成。
 
    ```sql
-   ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 2;
+   ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 1;
    ```
 
 5. `resume-materialize`
@@ -161,7 +161,7 @@ python3 plan_s3_ttl_tiering.py \
   --output-dir .
 ```
 
-在每个目标 replica 上执行当前 batch 的本地 `storage_policy`：
+在目标 replica group 的一个 replica 上执行当前 batch 的 `storage_policy` alter：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -187,7 +187,7 @@ python3 plan_s3_ttl_tiering.py \
   --mode apply-ttl
 ```
 
-提交当前 batch 的 `MATERIALIZE TTL`，默认同步等待所有 replica 完成：
+提交当前 batch 的 `MATERIALIZE TTL`，默认同步等待当前 replica 完成：
 
 ```bash
 python3 plan_s3_ttl_tiering.py \
@@ -268,13 +268,13 @@ python3 plan_s3_ttl_tiering.py \
 
 ## ReplicatedMergeTree 约束
 
-对 `ReplicatedMergeTree`，`MODIFY SETTING storage_policy` 和 `MODIFY TTL` 的同步语义不同：
+对 `ReplicatedMergeTree`，metadata `ALTER` 和 mutation 都会写入 replicated metadata / mutation log：
 
-- `MODIFY SETTING storage_policy` 是本地 table setting，不会进入 replicated metadata log；目标 shard 内每个目标 replica 都要执行 `--mode apply-policy`。
-- `MODIFY TTL` 是 replicated metadata alter，会进入 `ALTER_METADATA` log；同一个 replica group 只执行一次 `--mode apply-ttl`。
+- `MODIFY SETTING storage_policy` 是 metadata alter；同一个 replica group 只执行一次 `--mode apply-policy`。
+- `MODIFY TTL` 是 metadata alter，会进入 `ALTER_METADATA` log；同一个 replica group 只执行一次 `--mode apply-ttl`。
 - `MATERIALIZE TTL` 是 mutation，会进入 `/mutations`；同一个 replica group 只执行一次 `--mode materialize`。
 
-如果两个 replica 都提交同一个 `MATERIALIZE TTL`，会产生两个独立 mutation，增加 mutation queue、后台 IO 和对象存储请求。脚本只连接一个目标 `ClickHouse` 节点，不使用 `clusterAllReplicas` 执行写操作。
+如果两个 replica 都提交同一个 `MATERIALIZE TTL`，会产生两个独立 mutation，增加 mutation queue、后台 IO 和对象存储请求。脚本只连接一个目标 `ClickHouse` 节点，不使用 `clusterAllReplicas` 执行写操作。`mutations_sync = 1` 是默认值，因为很多历史集群的 Keeper metadata 里可能残留 inactive stale replicas；使用 `mutations_sync = 2` 会等待这些 stale replicas，导致客户端收到 `UNFINISHED`，但 mutation 实际已经异步提交。
 
 ## 本地验证结果
 
