@@ -780,9 +780,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "materialize submits MATERIALIZE TTL; resume-materialize only watches existing MATERIALIZE TTL mutations."
         ),
     )
-    action = parser.add_mutually_exclusive_group()
-    action.add_argument("--execute-materialize", action="store_true", help=argparse.SUPPRESS)
-    action.add_argument("--resume-materialize", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--execute-materialize", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--resume-materialize", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output-dir", default=".", help="Directory for run log and skip report.")
     parser.add_argument("--log-file", default="ttl_recompress.log")
     parser.add_argument("--skip-report", default="ttl_recompress_skipped.tsv")
