@@ -780,8 +780,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "materialize submits MATERIALIZE TTL; resume-materialize only watches existing MATERIALIZE TTL mutations."
         ),
     )
-    parser.add_argument("--execute-materialize", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--resume-materialize", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output-dir", default=".", help="Directory for run log and skip report.")
     parser.add_argument("--log-file", default="ttl_recompress.log")
     parser.add_argument("--skip-report", default="ttl_recompress_skipped.tsv")
@@ -798,16 +796,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=100, help="Print scan progress every N tables. Use 0 to disable.")
     parser.add_argument("--quiet", action="store_true", help="Disable progress logs.")
     args = parser.parse_args(argv)
-    mode_explicit = "--mode" in argv or any(item.startswith("--mode=") for item in argv)
-    if args.execute_materialize:
-        if mode_explicit and args.mode != "materialize":
-            parser.error("--execute-materialize conflicts with --mode; use --mode materialize")
-        args.mode = "materialize"
-    if args.resume_materialize:
-        if mode_explicit and args.mode != "resume-materialize":
-            parser.error("--resume-materialize conflicts with --mode; use --mode resume-materialize")
-        args.mode = "resume-materialize"
-
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
     if args.batch < 0:
