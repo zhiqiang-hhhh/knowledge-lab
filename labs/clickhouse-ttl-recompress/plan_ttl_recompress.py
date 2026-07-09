@@ -78,6 +78,8 @@ class MaterializePrecheck:
     target_codec: str
     active_parts: int
     active_rows: int
+    target_codec_parts: int
+    target_codec_rows: int
     due_parts: int
     due_rows: int
     due_non_target_parts: int
@@ -696,6 +698,8 @@ def materialize_precheck(client, args: argparse.Namespace, plan: TablePlan) -> M
             target_codec="",
             active_parts=0,
             active_rows=0,
+            target_codec_parts=0,
+            target_codec_rows=0,
             due_parts=0,
             due_rows=0,
             due_non_target_parts=0,
@@ -741,6 +745,16 @@ def materialize_precheck(client, args: argparse.Namespace, plan: TablePlan) -> M
     normalized_target = normalize_codec_expression(target_codec)
     active_parts = sum(group.active_parts for group in groups)
     active_rows = sum(group.active_rows for group in groups)
+    target_codec_parts = sum(
+        group.active_parts
+        for group in groups
+        if normalize_codec_expression(group.codec) == normalized_target
+    )
+    target_codec_rows = sum(
+        group.active_rows
+        for group in groups
+        if normalize_codec_expression(group.codec) == normalized_target
+    )
     due_parts = sum(group.due_parts for group in groups)
     due_rows = sum(group.due_rows for group in groups)
     due_non_target_parts = sum(
@@ -767,6 +781,13 @@ def materialize_precheck(client, args: argparse.Namespace, plan: TablePlan) -> M
     if active_parts == 0:
         should_submit = False
         reason = "table has no active parts"
+    elif target_codec_parts > 0:
+        should_submit = False
+        reason = (
+            "active parts already include target codec "
+            f"{target_codec}; skip to avoid duplicate MATERIALIZE TTL: "
+            f"parts={target_codec_parts}, rows={target_codec_rows}"
+        )
     elif due_non_target_parts > 0:
         should_submit = True
         reason = (
@@ -797,6 +818,8 @@ def materialize_precheck(client, args: argparse.Namespace, plan: TablePlan) -> M
         target_codec=target_codec,
         active_parts=active_parts,
         active_rows=active_rows,
+        target_codec_parts=target_codec_parts,
+        target_codec_rows=target_codec_rows,
         due_parts=due_parts,
         due_rows=due_rows,
         due_non_target_parts=due_non_target_parts,
@@ -1018,7 +1041,8 @@ def execute_materialize_batch(client, args: argparse.Namespace, batch: list[Tabl
                 args,
                 "MATERIALIZE TTL precheck "
                 f"{index}/{len(batch)} for {plan.table.database}.{plan.table.name}: "
-                f"{precheck.reason}; active_parts={precheck.active_parts}, due_parts={precheck.due_parts}, "
+                f"{precheck.reason}; active_parts={precheck.active_parts}, "
+                f"target_codec_parts={precheck.target_codec_parts}, due_parts={precheck.due_parts}, "
                 f"due_non_target_parts={precheck.due_non_target_parts}, "
                 f"missing_ttl_info_non_target_parts={precheck.missing_ttl_info_non_target_parts}",
             )

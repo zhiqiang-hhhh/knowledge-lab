@@ -47,8 +47,8 @@
    提交新的 `MATERIALIZE TTL` 前，脚本会用 `system.parts` 做 per-table precheck：
 
    - 没有 active parts 的表会跳过。
-   - 只检查已经到期的 recompression TTL parts，即 `recompression_ttl_info.max <= now()` 的 active parts。
-   - 如果已经到期的 parts 都是当前 `TTL RECOMPRESS` 里的目标 codec，会跳过。
+   - 如果任意 active part 的 `default_compression_codec` 已经等于当前 `TTL RECOMPRESS` 里的目标 codec，会跳过。这表示历史上已经触发过、触发后部分完成、或当前已有相关 mutation 在推进；重复提交成本过高，所以采用保守策略。
+   - 只有在没有目标 codec active parts 时，才继续检查已经到期的 recompression TTL parts，即 `recompression_ttl_info.max <= now()` 的 active parts。
    - 如果 active non-target parts 缺少 `recompression_ttl_info`，脚本不会跳过，因为这通常表示新增 TTL 元数据后老 parts 还没有被 `MATERIALIZE TTL` 重新计算过。
 
 4. `resume-materialize`
