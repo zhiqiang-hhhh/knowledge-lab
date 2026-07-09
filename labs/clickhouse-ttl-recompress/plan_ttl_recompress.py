@@ -60,6 +60,33 @@ class MutationState:
     status: str
 
 
+@dataclasses.dataclass
+class CodecPartGroup:
+    codec: str
+    active_parts: int
+    active_rows: int
+    due_parts: int
+    due_rows: int
+    missing_ttl_info_parts: int
+    missing_ttl_info_rows: int
+
+
+@dataclasses.dataclass
+class MaterializePrecheck:
+    should_submit: bool
+    reason: str
+    target_codec: str
+    active_parts: int
+    active_rows: int
+    due_parts: int
+    due_rows: int
+    due_non_target_parts: int
+    due_non_target_rows: int
+    missing_ttl_info_non_target_parts: int
+    missing_ttl_info_non_target_rows: int
+    codec_groups: list[CodecPartGroup]
+
+
 def quote_identifier(name: str) -> str:
     return "`" + name.replace("`", "``") + "`"
 
@@ -70,6 +97,17 @@ def quote_table(database: str, table: str) -> str:
 
 def quote_literal(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def compact_sql_expression(value: str) -> str:
+    return re.sub(r"\s+", "", value or "")
+
+
+def normalize_codec_expression(value: str) -> str:
+    compact = compact_sql_expression(value).upper()
+    if compact.startswith("CODEC(") and compact.endswith(")"):
+        return compact[len("CODEC(") : -1]
+    return compact
 
 
 def split_csv(value: str | None) -> list[str]:
@@ -211,6 +249,39 @@ def find_next_keyword_top_level(sql: str, keywords: list[str], start: int) -> in
     return len(sql)
 
 
+def find_matching_paren(sql: str, open_pos: int) -> int:
+    if open_pos < 0 or open_pos >= len(sql) or sql[open_pos] != "(":
+        return -1
+
+    quote = None
+    depth = 0
+    i = open_pos
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote and quote in {"'", '"', "`"}:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        if ch in {"'", '"', "`"}:
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 def split_top_level_commas(value: str) -> list[str]:
     result = []
     part_start = 0
@@ -257,6 +328,26 @@ def classify_ttl_entries(entries: list[str]) -> tuple[list[str], list[str], list
             delete_entries.append(entry)
 
     return recompress_entries, delete_entries, other_entries
+
+
+def extract_recompress_codec(entry: str) -> str | None:
+    recompress_pos = find_keyword_top_level(entry, "RECOMPRESS")
+    if recompress_pos < 0:
+        return None
+    codec_pos = find_keyword_top_level(entry, "CODEC", recompress_pos + len("RECOMPRESS"))
+    if codec_pos < 0:
+        return None
+    open_pos = entry.find("(", codec_pos + len("CODEC"))
+    close_pos = find_matching_paren(entry, open_pos)
+    if close_pos < 0:
+        return None
+    return entry[open_pos + 1 : close_pos].strip()
+
+
+def materialize_target_codec(args: argparse.Namespace, plan: TablePlan) -> str | None:
+    if len(plan.current_ttl_recompress_entries) != 1:
+        return None
+    return extract_recompress_codec(plan.current_ttl_recompress_entries[0]) or args.codec
 
 
 def classify_ttl_state(
@@ -591,6 +682,145 @@ def pending_materialize_mutation(client, database: str, table: str) -> MutationS
     return states[0] if states else None
 
 
+def materialize_precheck(client, args: argparse.Namespace, plan: TablePlan) -> MaterializePrecheck:
+    database = plan.table.database
+    table = plan.table.name
+    target_codec = materialize_target_codec(args, plan)
+    if target_codec is None:
+        return MaterializePrecheck(
+            should_submit=True,
+            reason=(
+                "cannot safely precheck tables with "
+                f"{len(plan.current_ttl_recompress_entries)} RECOMPRESS TTL entries"
+            ),
+            target_codec="",
+            active_parts=0,
+            active_rows=0,
+            due_parts=0,
+            due_rows=0,
+            due_non_target_parts=0,
+            due_non_target_rows=0,
+            missing_ttl_info_non_target_parts=0,
+            missing_ttl_info_non_target_rows=0,
+            codec_groups=[],
+        )
+
+    rows = query_rows(
+        client,
+        f"""
+        SELECT
+            default_compression_codec AS codec,
+            count() AS active_parts,
+            sum(rows) AS active_rows,
+            countIf(arrayExists(x -> x <= now(), `recompression_ttl_info.max`)) AS due_parts,
+            sumIf(rows, arrayExists(x -> x <= now(), `recompression_ttl_info.max`)) AS due_rows,
+            countIf(empty(`recompression_ttl_info.max`)) AS missing_ttl_info_parts,
+            sumIf(rows, empty(`recompression_ttl_info.max`)) AS missing_ttl_info_rows
+        FROM system.parts
+        WHERE database = {quote_literal(database)}
+          AND table = {quote_literal(table)}
+          AND active
+        GROUP BY codec
+        ORDER BY active_parts DESC, codec
+        """,
+    )
+
+    groups = [
+        CodecPartGroup(
+            codec=str(row.get("codec") or ""),
+            active_parts=int(row.get("active_parts") or 0),
+            active_rows=int(row.get("active_rows") or 0),
+            due_parts=int(row.get("due_parts") or 0),
+            due_rows=int(row.get("due_rows") or 0),
+            missing_ttl_info_parts=int(row.get("missing_ttl_info_parts") or 0),
+            missing_ttl_info_rows=int(row.get("missing_ttl_info_rows") or 0),
+        )
+        for row in rows
+    ]
+
+    normalized_target = normalize_codec_expression(target_codec)
+    active_parts = sum(group.active_parts for group in groups)
+    active_rows = sum(group.active_rows for group in groups)
+    due_parts = sum(group.due_parts for group in groups)
+    due_rows = sum(group.due_rows for group in groups)
+    due_non_target_parts = sum(
+        group.due_parts
+        for group in groups
+        if normalize_codec_expression(group.codec) != normalized_target
+    )
+    due_non_target_rows = sum(
+        group.due_rows
+        for group in groups
+        if normalize_codec_expression(group.codec) != normalized_target
+    )
+    missing_ttl_info_non_target_parts = sum(
+        group.missing_ttl_info_parts
+        for group in groups
+        if normalize_codec_expression(group.codec) != normalized_target
+    )
+    missing_ttl_info_non_target_rows = sum(
+        group.missing_ttl_info_rows
+        for group in groups
+        if normalize_codec_expression(group.codec) != normalized_target
+    )
+
+    if active_parts == 0:
+        should_submit = False
+        reason = "table has no active parts"
+    elif due_non_target_parts > 0:
+        should_submit = True
+        reason = (
+            "active parts with expired recompression TTL still use a non-target codec: "
+            f"parts={due_non_target_parts}, rows={due_non_target_rows}, target={target_codec}"
+        )
+    elif missing_ttl_info_non_target_parts > 0:
+        should_submit = True
+        reason = (
+            "active non-target parts have no recompression TTL info; "
+            "MATERIALIZE TTL is needed to calculate and apply current TTL metadata: "
+            f"parts={missing_ttl_info_non_target_parts}, rows={missing_ttl_info_non_target_rows}, "
+            f"target={target_codec}"
+        )
+    elif due_parts == 0:
+        should_submit = False
+        reason = "no active parts have expired recompression TTL"
+    else:
+        should_submit = False
+        reason = (
+            "all active parts with expired recompression TTL already use target codec "
+            f"{target_codec}: parts={due_parts}, rows={due_rows}"
+        )
+
+    return MaterializePrecheck(
+        should_submit=should_submit,
+        reason=reason,
+        target_codec=target_codec,
+        active_parts=active_parts,
+        active_rows=active_rows,
+        due_parts=due_parts,
+        due_rows=due_rows,
+        due_non_target_parts=due_non_target_parts,
+        due_non_target_rows=due_non_target_rows,
+        missing_ttl_info_non_target_parts=missing_ttl_info_non_target_parts,
+        missing_ttl_info_non_target_rows=missing_ttl_info_non_target_rows,
+        codec_groups=groups,
+    )
+
+
+def skipped_materialize_state(plan: TablePlan, reason: str) -> MutationState:
+    return MutationState(
+        database=plan.table.database,
+        table=plan.table.name,
+        mutation_id="",
+        command="MATERIALIZE TTL",
+        create_time="",
+        is_done=1,
+        latest_fail_reason=reason,
+        parts_to_do=0,
+        status="skipped",
+    )
+
+
 def new_materialize_mutation(client, database: str, table: str, before_ids: set[str]) -> MutationState | None:
     for state in query_materialize_mutations(client, database, table):
         if state.mutation_id not in before_ids:
@@ -782,6 +1012,18 @@ def execute_materialize_batch(client, args: argparse.Namespace, batch: list[Tabl
                     f"{index}/{len(batch)} for {plan.table.database}.{plan.table.name}: {existing.mutation_id}",
                 )
                 states.append(existing)
+                continue
+            precheck = materialize_precheck(client, args, plan)
+            log(
+                args,
+                "MATERIALIZE TTL precheck "
+                f"{index}/{len(batch)} for {plan.table.database}.{plan.table.name}: "
+                f"{precheck.reason}; active_parts={precheck.active_parts}, due_parts={precheck.due_parts}, "
+                f"due_non_target_parts={precheck.due_non_target_parts}, "
+                f"missing_ttl_info_non_target_parts={precheck.missing_ttl_info_non_target_parts}",
+            )
+            if not precheck.should_submit:
+                states.append(skipped_materialize_state(plan, precheck.reason))
                 continue
             wait_for_materialize_submit_capacity(client, args)
             log(args, f"Submitting MATERIALIZE TTL {index}/{len(batch)}")

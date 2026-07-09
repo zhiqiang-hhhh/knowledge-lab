@@ -44,6 +44,13 @@
    默认 `--mutations-sync 0` 只异步提交 mutation；如果需要等待完成，使用 `--wait-materialize` 让脚本轮询 `system.mutations`。
    不建议默认使用 `--mutations-sync 1` 做 server-side 长等待，因为 HTTP 客户端或中间层连接超时/断开时，`ClickHouse` 可能在 mutation 已经创建甚至完成后把这条 HTTP query 记录为 `QUERY_WAS_CANCELLED`。
 
+   提交新的 `MATERIALIZE TTL` 前，脚本会用 `system.parts` 做 per-table precheck：
+
+   - 没有 active parts 的表会跳过。
+   - 只检查已经到期的 recompression TTL parts，即 `recompression_ttl_info.max <= now()` 的 active parts。
+   - 如果已经到期的 parts 都是当前 `TTL RECOMPRESS` 里的目标 codec，会跳过。
+   - 如果 active non-target parts 缺少 `recompression_ttl_info`，脚本不会跳过，因为这通常表示新增 TTL 元数据后老 parts 还没有被 `MATERIALIZE TTL` 重新计算过。
+
 4. `resume-materialize`
    不提交新的 mutation，只从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation 并继续观察。
 
