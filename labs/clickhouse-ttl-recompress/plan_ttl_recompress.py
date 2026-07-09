@@ -765,7 +765,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Comma-separated tables to include. Supports unqualified table names or qualified db.table names."
         ),
     )
-    parser.add_argument("--codec", default="ZSTD(12)")
+    parser.add_argument(
+        "--codec",
+        default="ZSTD(4)",
+        help=(
+            "ClickHouse codec expression used inside RECOMPRESS CODEC(...), "
+            "for example LZ4, LZ4HC(9), or ZSTD(4). Default: ZSTD(4)."
+        ),
+    )
     parser.add_argument("--weekly-hot-weeks", type=int, default=1)
     parser.add_argument("--daily-hot-days", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=10)

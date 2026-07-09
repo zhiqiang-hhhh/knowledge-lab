@@ -8,7 +8,7 @@
 
 默认策略：
 
-- codec: `ZSTD(12)`
+- codec: `ZSTD(4)`
 - 周分区热窗口：`<partition_key> + INTERVAL 1 WEEK`
 - 天分区热窗口：`<partition_key> + INTERVAL 2 DAY`
 
@@ -24,7 +24,7 @@
 
    ```sql
    ALTER TABLE db.table MODIFY TTL
-       <recompress_expr> RECOMPRESS CODEC(ZSTD(12)),
+       <recompress_expr> RECOMPRESS CODEC(ZSTD(4)),
        <existing_delete_ttl>
    SETTINGS materialize_ttl_after_modify = 0;
    ```
