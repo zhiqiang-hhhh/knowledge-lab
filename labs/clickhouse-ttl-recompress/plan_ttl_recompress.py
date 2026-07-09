@@ -591,6 +591,41 @@ def pending_materialize_mutation(client, database: str, table: str) -> MutationS
     return states[0] if states else None
 
 
+def new_materialize_mutation(client, database: str, table: str, before_ids: set[str]) -> MutationState | None:
+    for state in query_materialize_mutations(client, database, table):
+        if state.mutation_id not in before_ids:
+            return state
+    return None
+
+
+def new_materialize_mutation_after_command_error(
+    client,
+    args: argparse.Namespace,
+    database: str,
+    table: str,
+    before_ids: set[str],
+) -> MutationState | None:
+    try:
+        return new_materialize_mutation(client, database, table, before_ids)
+    except Exception as exc:
+        log(
+            args,
+            "Could not inspect system.mutations on the existing connection after "
+            f"MATERIALIZE TTL error for {database}.{table}: {exc}; retrying with a new connection",
+        )
+
+    try:
+        fresh_client = get_client(args)
+        return new_materialize_mutation(fresh_client, database, table, before_ids)
+    except Exception as exc:
+        log(
+            args,
+            "Could not inspect system.mutations on a new connection after "
+            f"MATERIALIZE TTL error for {database}.{table}: {exc}",
+        )
+        return None
+
+
 def submit_materialize(client, args: argparse.Namespace, plan: TablePlan) -> MutationState:
     database = plan.table.database
     table = plan.table.name
@@ -602,11 +637,21 @@ def submit_materialize(client, args: argparse.Namespace, plan: TablePlan) -> Mut
     before_ids = {state.mutation_id for state in query_materialize_mutations(client, database, table)}
     statement = materialize_statement(args, plan)
     print(f"Submitting MATERIALIZE TTL {database}.{table}", flush=True)
-    command(client, statement)
-    after = query_materialize_mutations(client, database, table)
-    for state in after:
-        if state.mutation_id not in before_ids:
-            return state
+    try:
+        command(client, statement)
+    except Exception as exc:
+        created = new_materialize_mutation_after_command_error(client, args, database, table, before_ids)
+        if created:
+            print(
+                "MATERIALIZE TTL command returned an error after creating mutation "
+                f"{database}.{table}: {exc}",
+                flush=True,
+            )
+            return created
+        raise
+    created = new_materialize_mutation(client, database, table, before_ids)
+    if created:
+        return created
     latest = latest_materialize_mutation(client, database, table)
     if latest:
         return latest
@@ -790,7 +835,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=".", help="Directory for run log and skip report.")
     parser.add_argument("--log-file", default="ttl_recompress.log")
     parser.add_argument("--skip-report", default="ttl_recompress_skipped.tsv")
-    parser.add_argument("--mutations-sync", type=int, default=1)
+    parser.add_argument(
+        "--mutations-sync",
+        type=int,
+        default=0,
+        help=(
+            "Value for MATERIALIZE TTL mutations_sync. Default 0 submits asynchronously; "
+            "use --wait-materialize for client-side polling."
+        ),
+    )
     parser.add_argument("--wait-materialize", action="store_true")
     parser.add_argument(
         "--max-pending-materialize",

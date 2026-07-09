@@ -37,10 +37,12 @@
    单独提交当前 batch 的 `MATERIALIZE TTL` mutation：
 
    ```sql
-   ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 1;
+   ALTER TABLE db.table MATERIALIZE TTL SETTINGS mutations_sync = 0;
    ```
 
    这个阶段只选择当前 table-level `TTL` 已经包含 `RECOMPRESS` 的表。
+   默认 `--mutations-sync 0` 只异步提交 mutation；如果需要等待完成，使用 `--wait-materialize` 让脚本轮询 `system.mutations`。
+   不建议默认使用 `--mutations-sync 1` 做 server-side 长等待，因为 HTTP 客户端或中间层连接超时/断开时，`ClickHouse` 可能在 mutation 已经创建甚至完成后把这条 HTTP query 记录为 `QUERY_WAS_CANCELLED`。
 
 4. `resume-materialize`
    不提交新的 mutation，只从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation 并继续观察。
