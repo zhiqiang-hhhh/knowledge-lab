@@ -13,7 +13,7 @@ except ModuleNotFoundError:
 
 
 SYSTEM_DATABASES = {"system", "INFORMATION_SCHEMA", "information_schema"}
-MODES = {"plan", "apply-ttl", "materialize", "resume-materialize"}
+MODES = {"plan", "apply-ttl", "materialize", "resume-materialize", "optimize"}
 
 
 @dataclasses.dataclass
@@ -38,6 +38,17 @@ class TablePlan:
     planned_ttl_entries: list[str]
     statements: list[str]
     current_ttl_state: str
+
+
+@dataclasses.dataclass
+class OptimizePlan:
+    database: str
+    table: str
+    partition: str
+    partition_id: str
+    default_compression_codec: str
+    bytes: int
+    statement: str
 
 
 @dataclasses.dataclass
@@ -462,7 +473,6 @@ def build_plan_for_table(args: argparse.Namespace, table: TableInfo) -> tuple[Ta
         + quote_table(table.database, table.name)
         + " MODIFY TTL\n    "
         + ",\n    ".join(planned_ttl_entries)
-        + "\nSETTINGS materialize_ttl_after_modify = 0"
     )
 
     return (
@@ -517,6 +527,13 @@ def materialize_statement(args: argparse.Namespace, plan: TablePlan) -> str:
 
 def ttl_statement(plan: TablePlan) -> str:
     return plan.statements[0]
+
+
+def recalculate_only_setting_statement(plan: TablePlan) -> str:
+    return (
+        f"ALTER TABLE {quote_table(plan.table.database, plan.table.name)} "
+        "MODIFY SETTING materialize_ttl_recalculate_only = true"
+    )
 
 
 def write_skip_report(args: argparse.Namespace, skipped: list[SkippedTable]) -> None:
@@ -610,11 +627,94 @@ def print_entries(indent: str, entries: list[str]) -> None:
 def execute_ttl_batch(client, batch: list[TablePlan]) -> None:
     for plan in batch:
         print(
+            "Enabling materialize_ttl_recalculate_only "
+            f"{plan.table.database}.{plan.table.name}",
+            flush=True,
+        )
+        command(client, recalculate_only_setting_statement(plan))
+        print(
             "Applying replicated TTL metadata ALTER "
             f"{plan.table.database}.{plan.table.name}",
             flush=True,
         )
         command(client, ttl_statement(plan))
+
+
+def optimize_statement(plan: OptimizePlan) -> str:
+    return (
+        f"OPTIMIZE TABLE {quote_table(plan.database, plan.table)} "
+        f"PARTITION ID {quote_literal(plan.partition_id)} FINAL"
+    )
+
+
+def fetch_optimize_plans(client, args: argparse.Namespace) -> list[OptimizePlan]:
+    included = set(split_csv(args.dbs))
+    excluded = SYSTEM_DATABASES | set(split_csv(args.dbs_exclude))
+
+    filters = ["active"]
+    if included:
+        filters.append("database IN (" + ", ".join(quote_literal(db) for db in sorted(included)) + ")")
+    if excluded:
+        filters.append("database NOT IN (" + ", ".join(quote_literal(db) for db in sorted(excluded)) + ")")
+    table_filter = table_filter_sql(args.tables, table_column="`table`")
+    if table_filter:
+        filters.append(table_filter)
+
+    rows = query_rows(
+        client,
+        f"""
+        SELECT
+            database,
+            `table`,
+            partition,
+            partition_id,
+            default_compression_codec,
+            sum(bytes) AS bys
+        FROM system.parts
+        WHERE {' AND '.join(filters)}
+        GROUP BY
+            database,
+            `table`,
+            partition,
+            partition_id,
+            default_compression_codec
+        ORDER BY bys DESC
+        LIMIT {args.optimize_limit}
+        """,
+    )
+    plans = []
+    seen_partitions: set[tuple[str, str, str]] = set()
+    for row in rows:
+        key = (
+            str(row.get("database") or ""),
+            str(row.get("table") or ""),
+            str(row.get("partition_id") or ""),
+        )
+        if key in seen_partitions:
+            continue
+        seen_partitions.add(key)
+        plan = OptimizePlan(
+            database=key[0],
+            table=key[1],
+            partition=str(row.get("partition") or ""),
+            partition_id=key[2],
+            default_compression_codec=str(row.get("default_compression_codec") or ""),
+            bytes=int(row.get("bys") or 0),
+            statement="",
+        )
+        plans.append(dataclasses.replace(plan, statement=optimize_statement(plan)))
+    return plans
+
+
+def execute_optimize_plans(client, plans: list[OptimizePlan]) -> None:
+    for index, plan in enumerate(plans, start=1):
+        print(
+            "Optimizing "
+            f"{index}/{len(plans)} {plan.database}.{plan.table} "
+            f"partition_id={plan.partition_id}, size={format_readable_size(plan.bytes)}",
+            flush=True,
+        )
+        command(client, plan.statement)
 
 
 def mutation_status(row: dict) -> str:
@@ -993,7 +1093,7 @@ def fetch_pending_materialize_states(client, args: argparse.Namespace) -> list[M
         f"""
         SELECT
             database,
-            table,
+            `table`,
             mutation_id,
             command,
             toString(create_time) AS create_time,
@@ -1095,7 +1195,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="plan",
         help=(
             "Execution mode. plan is dry-run; apply-ttl submits replicated TTL metadata ALTER; "
-            "materialize submits MATERIALIZE TTL; resume-materialize only watches existing MATERIALIZE TTL mutations."
+            "materialize submits MATERIALIZE TTL; resume-materialize only watches existing MATERIALIZE TTL mutations; "
+            "optimize optimizes the largest active system.parts partitions."
         ),
     )
     parser.add_argument("--output-dir", default=".", help="Directory for run log and skip report.")
@@ -1119,6 +1220,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--materialize-timeout-seconds", type=int, default=3600)
     parser.add_argument("--materialize-poll-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--optimize-limit",
+        type=int,
+        default=20,
+        help="Number of largest system.parts partition/codec groups to optimize in --mode optimize.",
+    )
     parser.add_argument("--log-every", type=int, default=100, help="Print scan progress every N tables. Use 0 to disable.")
     parser.add_argument("--quiet", action="store_true", help="Disable progress logs.")
     args = parser.parse_args(argv)
@@ -1138,6 +1245,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--materialize-timeout-seconds must be positive")
     if args.materialize_poll_seconds <= 0:
         parser.error("--materialize-poll-seconds must be positive")
+    if args.optimize_limit <= 0:
+        parser.error("--optimize-limit must be positive")
     if args.log_every < 0:
         parser.error("--log-every must be non-negative")
     return args
@@ -1149,10 +1258,17 @@ def main(argv: list[str]) -> int:
 
     scanned_tables = 0
     skipped: list[SkippedTable] = []
+    optimize_plans: list[OptimizePlan] = []
     if args.mode == "resume-materialize":
         log(args, "Resuming MATERIALIZE TTL state polling from system.mutations")
         plans = []
         batch = []
+    elif args.mode == "optimize":
+        log(args, f"Fetching largest active parts groups for OPTIMIZE; limit={args.optimize_limit}")
+        plans = []
+        batch = []
+        optimize_plans = fetch_optimize_plans(client, args)
+        log(args, f"Selected {len(optimize_plans)} optimize targets")
     else:
         stage_label = "MATERIALIZE TTL stage" if args.mode == "materialize" else "TTL RECOMPRESS planning"
         log(args, f"Fetching candidate MergeTree tables for {stage_label}")
@@ -1199,6 +1315,17 @@ def main(argv: list[str]) -> int:
     print(f"Output directory: {args.output_dir}")
     print()
 
+    if args.mode == "optimize":
+        print("Optimize targets by active bytes desc:")
+        for index, plan in enumerate(optimize_plans, start=1):
+            print(f"[{index}] {plan.database}.{plan.table}")
+            print(f"    partition: {plan.partition}")
+            print(f"    partition_id: {plan.partition_id}")
+            print(f"    default_compression_codec: {plan.default_compression_codec}")
+            print(f"    bytes: {plan.bytes} ({format_readable_size(plan.bytes)})")
+            print("    planned OPTIMIZE statement:")
+            print(f"      {plan.statement}")
+            print()
     for index, plan in enumerate(batch, start=start + 1):
         print(f"[{index}] {plan.table.database}.{plan.table.name}")
         print(f"    partition_key: {plan.table.partition_key}")
@@ -1221,16 +1348,24 @@ def main(argv: list[str]) -> int:
             print(f"      TTL RECOMPRESS: {plan.recompress_expr} RECOMPRESS CODEC({args.codec})")
             print("      full TTL:")
             print_entries("        ", plan.planned_ttl_entries)
+            print("    planned replicated setting statement:")
+            print("      " + recalculate_only_setting_statement(plan).replace("\n", "\n      "))
             print("    planned replicated TTL statement:")
             print("      " + ttl_statement(plan).replace("\n", "\n      "))
         print()
 
-    if args.mode == "apply-ttl":
+    if args.mode == "optimize":
+        if optimize_plans:
+            execute_optimize_plans(client, optimize_plans)
+            print("Executed OPTIMIZE statements for selected largest parts groups.")
+        else:
+            print("No OPTIMIZE statements to execute.")
+    elif args.mode == "apply-ttl":
         if batch:
             execute_ttl_batch(client, batch)
-            print("Executed replicated TTL ALTER statements for current batch.")
+            print("Executed replicated setting and TTL ALTER statements for current batch.")
         else:
-            print("No replicated TTL ALTER statements to execute for current batch.")
+            print("No replicated setting or TTL ALTER statements to execute for current batch.")
         if not args.all_batches and len(plans) > end:
             print(
                 "More planned tables remain. Re-run with "
@@ -1253,7 +1388,7 @@ def main(argv: list[str]) -> int:
     else:
         print("Dry-run only.")
         print("Run --mode apply-ttl once per `ReplicatedMergeTree` replica group.")
-        print("Use --mode materialize only after the replicated `TTL` metadata `ALTER` has been reviewed/applied.")
+        print("After every table has been processed by --mode apply-ttl, run --mode optimize.")
 
     if skipped:
         print(f"Skipped table report: {Path(args.output_dir) / args.skip_report}")

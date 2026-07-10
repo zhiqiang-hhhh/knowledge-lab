@@ -14,26 +14,59 @@
 
 ## 执行模型
 
-脚本把流程拆成四个显式模式：
+脚本把流程拆成几个显式模式：
 
 1. `plan`
    默认模式。只扫描表、打印 batch 计划和 skip report，不执行写操作。
 
 2. `apply-ttl`
-   提交 replicated metadata `ALTER`：
+   先提交 replicated setting `ALTER`，让后续 TTL materialize 只重算 TTL metadata：
+
+   ```sql
+   ALTER TABLE db.table
+   MODIFY SETTING materialize_ttl_recalculate_only = true;
+   ```
+
+   然后提交 replicated TTL metadata `ALTER`：
 
    ```sql
    ALTER TABLE db.table MODIFY TTL
        <recompress_expr> RECOMPRESS CODEC(ZSTD(4)),
-       <existing_delete_ttl>
-   SETTINGS materialize_ttl_after_modify = 0;
+       <existing_delete_ttl>;
    ```
 
    `MODIFY TTL` 是 replicated metadata `ALTER`。对同一个 `ReplicatedMergeTree` replica group 只执行一次，其他 active replicas 通过 replication log 自动应用。脚本不会做 cluster fanout，也不会对同一个 replica group 的每个 replica 分别写入。
 
    对没有 table-level `TTL` 的表，脚本会写入只包含一条 `RECOMPRESS` 规则的新 `TTL`。
 
-3. `materialize`
+3. `optimize`
+   对所有表做完 `apply-ttl` 后，从 `system.parts` 找出 active parts 里磁盘占用最大的分区/codec 组合：
+
+   ```sql
+   SELECT
+       database,
+       `table`,
+       partition,
+       default_compression_codec,
+       sum(bytes) AS bys
+   FROM system.parts
+   WHERE database NOT IN ('system')
+   GROUP BY
+       database,
+       `table`,
+       default_compression_codec,
+       partition
+   ORDER BY bys DESC
+   LIMIT 20;
+   ```
+
+   脚本实际查询时会额外取 `partition_id`，并生成：
+
+   ```sql
+   OPTIMIZE TABLE db.table PARTITION ID '<partition_id>' FINAL;
+   ```
+
+4. `materialize`
    单独提交当前 batch 的 `MATERIALIZE TTL` mutation：
 
    ```sql
@@ -51,7 +84,7 @@
    - 只有在没有目标 codec active parts 时，才继续检查已经到期的 recompression TTL parts，即 `recompression_ttl_info.max <= now()` 的 active parts。
    - 如果 active non-target parts 缺少 `recompression_ttl_info`，脚本不会跳过，因为这通常表示新增 TTL 元数据后老 parts 还没有被 `MATERIALIZE TTL` 重新计算过。
 
-4. `resume-materialize`
+5. `resume-materialize`
    不提交新的 mutation，只从 `system.mutations` 查询未完成的 `MATERIALIZE TTL` mutation 并继续观察。
 
 ## 选择规则
@@ -115,6 +148,7 @@ dry-run 输出会展示：
 - 当前 delete `TTL`
 - 新生成的 `TTL RECOMPRESS`
 - 完整的新 `TTL`
+- 将要提交的 replicated `MODIFY SETTING materialize_ttl_recalculate_only = true` statement
 - 将要提交的 replicated `MODIFY TTL` statement
 
 输出文件位于 `--output-dir`：
