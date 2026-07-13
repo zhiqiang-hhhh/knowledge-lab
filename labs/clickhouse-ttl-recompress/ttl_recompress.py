@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import textwrap
+import time
 from dataclasses import dataclass
 
 try:
@@ -121,7 +123,7 @@ def fetch_tables(client, args: argparse.Namespace) -> list[Table]:
     tables = csv_values(args.tables)
     if tables:
         conditions.append("`table` IN (" + ", ".join(map(quote_literal, tables)) + ")")
-    result = client.query(
+    query = (
         """
         SELECT
             metadata.database,
@@ -151,6 +153,9 @@ def fetch_tables(client, args: argparse.Namespace) -> list[Table]:
         ORDER BY ranked.total_bytes DESC, metadata.database, metadata.name
         """
     )
+    query = textwrap.dedent(query).strip()
+    log_sql("fetch", query)
+    result = client.query(query)
     return [
         Table(str(row[0]), str(row[1]), str(row[2]), str(row[3]), int(row[4]), int(row[5]))
         for row in result.result_rows
@@ -164,6 +169,17 @@ def format_bytes(size: int) -> str:
             return f"{int(value)} {unit}" if unit == "B" else f"{value:.2f} {unit}"
         value /= 1024
     return f"{size} B"
+
+
+def log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
+
+
+def log_sql(stage: str, sql: str) -> None:
+    normalized = sql.strip()
+    suffix = "" if normalized.endswith(";") else ";"
+    log(f"stage={stage} sql=\n{normalized}{suffix}")
 
 
 def skip_reason(table: Table, ttl: str | None) -> str | None:
@@ -224,7 +240,17 @@ def main(argv: list[str]) -> int:
         password=args.password,
         secure=args.secure,
     )
-    tables = fetch_tables(client, args)
+    log(
+        "stage=fetch status=started "
+        f"limit={args.limit} databases={args.databases or '(all non-system)'} "
+        f"tables={args.tables or '(all)'}"
+    )
+    try:
+        tables = fetch_tables(client, args)
+    except Exception as error:
+        log(f"stage=fetch status=failed error={error}")
+        raise
+    log(f"stage=fetch status=completed selected={len(tables)}")
     print(f"Top {args.limit} active tables by bytes (selected={len(tables)}):")
     for index, table in enumerate(tables, start=1):
         print(
@@ -233,21 +259,48 @@ def main(argv: list[str]) -> int:
         )
     print()
 
+    log(f"stage=plan status=started tables={len(tables)}")
     planned = skipped = 0
+    execution_plan: list[tuple[Table, list[str]]] = []
     for index, table in enumerate(tables, start=1):
+        log(f"stage=plan status=processing table={index}/{len(tables)} name={table.database}.{table.name}")
         ttl = extract_ttl(table.create_query)
         reason = skip_reason(table, ttl)
         if reason:
             print_table_plan(index, table, ttl, None, reason)
+            log(f"stage=plan status=skipped table={index}/{len(tables)} reason={reason}")
             skipped += 1
             continue
         statements = render_alters(table, ttl, args.codec.strip(), args.cluster)
         print_table_plan(index, table, ttl, statements, None)
-        for statement in statements:
-            if args.apply:
-                client.command(statement)
+        execution_plan.append((table, statements))
         planned += 1
-    print(f"mode={'apply' if args.apply else 'dry-run'} planned={planned} skipped={skipped}", file=sys.stderr)
+    log(f"stage=plan status=completed planned={planned} skipped={skipped}")
+
+    if args.apply:
+        log(f"stage=apply status=started tables={len(execution_plan)}")
+        for index, (table, statements) in enumerate(execution_plan, start=1):
+            name = f"{table.database}.{table.name}"
+            log(f"stage=apply status=setting-started table={index}/{len(execution_plan)} name={name}")
+            log_sql("apply", statements[0])
+            try:
+                client.command(statements[0])
+            except Exception as error:
+                log(f"stage=apply status=setting-failed table={index}/{len(execution_plan)} name={name} error={error}")
+                raise
+            log(f"stage=apply status=setting-completed table={index}/{len(execution_plan)} name={name}")
+            log(f"stage=apply status=ttl-started table={index}/{len(execution_plan)} name={name}")
+            log_sql("apply", statements[1])
+            try:
+                client.command(statements[1])
+            except Exception as error:
+                log(f"stage=apply status=ttl-failed table={index}/{len(execution_plan)} name={name} error={error}")
+                raise
+            log(f"stage=apply status=ttl-completed table={index}/{len(execution_plan)} name={name}")
+        log(f"stage=apply status=completed tables={len(execution_plan)}")
+    else:
+        log("stage=apply status=skipped reason=dry-run; rerun with --apply to execute")
+    log(f"run status=completed mode={'apply' if args.apply else 'dry-run'} planned={planned} skipped={skipped}")
     return 0
 
 

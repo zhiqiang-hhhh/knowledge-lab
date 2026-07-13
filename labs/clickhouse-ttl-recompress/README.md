@@ -34,6 +34,7 @@ ALTER TABLE db.table ON CLUSTER production
 
 - 脚本按 `system.parts` 的 `sum(bytes)` 降序选择前 `--limit 20` 张 active 表，并在日志开头输出 database、table、总行数和总 bytes。
 - 每张候选表都会输出当前 partition key、当前 table TTL、计划应用的 setting 和完整 TTL；跳过时输出 skip reason。
+- stderr 进度日志明确标记 `stage=fetch`、`stage=plan` 和 `stage=apply`。fetch 会打印完整查询 SQL；apply 阶段会逐表打印 setting ALTER 和 TTL ALTER 的完整 SQL及其开始、完成状态。
 - `MODIFY TTL` 替换的是完整 table-level TTL，因此脚本会保留已有 DELETE/MOVE/GROUP BY TTL，而不是只写新的 RECOMPRESS rule。
 - 已有任意 `RECOMPRESS` rule 的表会跳过。
 - RECOMPRESS 生效表达式固定为 `system.tables.partition_key + INTERVAL 1 WEEK`，不再接受命令行表达式。
