@@ -23,6 +23,8 @@ class Table:
     name: str
     create_query: str
     partition_key: str
+    total_rows: int
+    total_bytes: int
 
 
 def quote_ident(value: str) -> str:
@@ -110,7 +112,7 @@ def csv_values(value: str | None) -> list[str]:
 
 
 def fetch_tables(client, args: argparse.Namespace) -> list[Table]:
-    conditions = ["engine LIKE '%MergeTree%'"]
+    conditions = ["active"]
     databases = csv_values(args.databases)
     if databases:
         conditions.append("database IN (" + ", ".join(map(quote_literal, databases)) + ")")
@@ -118,13 +120,73 @@ def fetch_tables(client, args: argparse.Namespace) -> list[Table]:
         conditions.append("database NOT IN (" + ", ".join(map(quote_literal, sorted(SYSTEM_DATABASES))) + ")")
     tables = csv_values(args.tables)
     if tables:
-        conditions.append("name IN (" + ", ".join(map(quote_literal, tables)) + ")")
+        conditions.append("`table` IN (" + ", ".join(map(quote_literal, tables)) + ")")
     result = client.query(
-        "SELECT database, name, create_table_query, partition_key FROM system.tables WHERE "
+        """
+        SELECT
+            metadata.database,
+            metadata.name,
+            metadata.create_table_query,
+            metadata.partition_key,
+            ranked.total_rows,
+            ranked.total_bytes
+        FROM
+        (
+            SELECT
+                database,
+                `table`,
+                sum(rows) AS total_rows,
+                sum(bytes) AS total_bytes
+            FROM system.parts
+            WHERE """
         + " AND ".join(conditions)
-        + " ORDER BY database, name"
+        + f"""
+            GROUP BY database, `table`
+            ORDER BY total_bytes DESC
+            LIMIT {args.limit}
+        ) AS ranked
+        INNER JOIN system.tables AS metadata
+            ON ranked.database = metadata.database AND ranked.`table` = metadata.name
+        WHERE metadata.engine LIKE '%MergeTree%'
+        ORDER BY ranked.total_bytes DESC, metadata.database, metadata.name
+        """
     )
-    return [Table(str(row[0]), str(row[1]), str(row[2]), str(row[3])) for row in result.result_rows]
+    return [
+        Table(str(row[0]), str(row[1]), str(row[2]), str(row[3]), int(row[4]), int(row[5]))
+        for row in result.result_rows
+    ]
+
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if value < 1024 or unit == "PiB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def skip_reason(table: Table, ttl: str | None) -> str | None:
+    if not table.partition_key.strip():
+        return "empty partition key"
+    if ttl and has_recompress(ttl):
+        return "already has TTL RECOMPRESS"
+    return None
+
+
+def print_table_plan(index: int, table: Table, ttl: str | None, statements: list[str] | None, reason: str | None) -> None:
+    print(f"-- [{index}] {table.database}.{table.name}")
+    print(f"-- rows: {table.total_rows}")
+    print(f"-- bytes: {table.total_bytes} ({format_bytes(table.total_bytes)})")
+    print(f"-- current partition key: {table.partition_key or '(none)'}")
+    print(f"-- current table TTL: {ttl or '(none)'}")
+    if reason:
+        print(f"-- skip reason: {reason}")
+    else:
+        assert statements is not None
+        print(f"-- planned setting: {statements[0]}")
+        print(f"-- planned TTL: {statements[1]}")
+    print()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -138,12 +200,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tables", help="Comma-separated unqualified table-name allowlist")
     parser.add_argument("--cluster", help="Add ON CLUSTER to both ALTER statements")
     parser.add_argument("--codec", default="ZSTD", help="Codec expression inside CODEC(...); default: ZSTD")
+    parser.add_argument("--limit", type=int, default=20, help="Maximum largest active tables to process; default: 20")
     parser.add_argument("--apply", action="store_true", help="Execute the plan; default is dry-run")
     args = parser.parse_args(argv)
     if ";" in args.codec:
         parser.error("codec must not contain semicolons")
     if not args.codec.strip():
         parser.error("codec must not be empty")
+    if args.limit <= 0:
+        parser.error("limit must be positive")
     return args
 
 
@@ -159,21 +224,26 @@ def main(argv: list[str]) -> int:
         password=args.password,
         secure=args.secure,
     )
+    tables = fetch_tables(client, args)
+    print(f"Top {args.limit} active tables by bytes (selected={len(tables)}):")
+    for index, table in enumerate(tables, start=1):
+        print(
+            f"  {index}. {table.database}.{table.name} "
+            f"rows={table.total_rows} bytes={table.total_bytes} ({format_bytes(table.total_bytes)})"
+        )
+    print()
+
     planned = skipped = 0
-    for table in fetch_tables(client, args):
-        if not table.partition_key.strip():
-            print(f"SKIP {table.database}.{table.name}: empty partition key", file=sys.stderr)
-            skipped += 1
-            continue
+    for index, table in enumerate(tables, start=1):
         ttl = extract_ttl(table.create_query)
-        if ttl and has_recompress(ttl):
-            print(f"SKIP {table.database}.{table.name}: already has TTL RECOMPRESS", file=sys.stderr)
+        reason = skip_reason(table, ttl)
+        if reason:
+            print_table_plan(index, table, ttl, None, reason)
             skipped += 1
             continue
         statements = render_alters(table, ttl, args.codec.strip(), args.cluster)
-        print(f"-- {table.database}.{table.name}")
+        print_table_plan(index, table, ttl, statements, None)
         for statement in statements:
-            print(statement + ";")
             if args.apply:
                 client.command(statement)
         planned += 1

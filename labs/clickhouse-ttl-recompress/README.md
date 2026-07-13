@@ -1,6 +1,7 @@
 # ClickHouse TTL recompress
 
 给 MergeTree 表增加 `TTL ... RECOMPRESS CODEC(ZSTD)`。脚本默认只输出 SQL，使用 `--apply` 才执行。
+处理范围默认限制为 `system.parts` 中 active bytes 最大的 20 张表，而不是整个集群的所有表。
 
 ```bash
 python3 -m pip install clickhouse-connect
@@ -31,6 +32,8 @@ ALTER TABLE db.table ON CLUSTER production
 
 注意：
 
+- 脚本按 `system.parts` 的 `sum(bytes)` 降序选择前 `--limit 20` 张 active 表，并在日志开头输出 database、table、总行数和总 bytes。
+- 每张候选表都会输出当前 partition key、当前 table TTL、计划应用的 setting 和完整 TTL；跳过时输出 skip reason。
 - `MODIFY TTL` 替换的是完整 table-level TTL，因此脚本会保留已有 DELETE/MOVE/GROUP BY TTL，而不是只写新的 RECOMPRESS rule。
 - 已有任意 `RECOMPRESS` rule 的表会跳过。
 - RECOMPRESS 生效表达式固定为 `system.tables.partition_key + INTERVAL 1 WEEK`，不再接受命令行表达式。
