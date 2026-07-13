@@ -18,6 +18,7 @@ class TtlRecompressTest(unittest.TestCase):
         table = Table("db", "t", "", "toStartOfWeek(ts)", 100, 1024)
         statements = render_alters(table, "ts + INTERVAL 30 DAY DELETE", "ZSTD", "prod")
         self.assertIn("MODIFY SETTING materialize_ttl_recalculate_only = true", statements[0])
+        self.assertIn("merge_with_recompression_ttl_timeout = 1800", statements[0])
         self.assertIn(
             "TTL ts + INTERVAL 30 DAY DELETE, toStartOfWeek(ts) + INTERVAL 1 WEEK RECOMPRESS CODEC(ZSTD)",
             statements[1],

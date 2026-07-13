@@ -104,7 +104,8 @@ def render_alters(table: Table, ttl: str | None, codec: str, cluster: str | None
     new_rule = f"{table.partition_key} + INTERVAL 1 WEEK RECOMPRESS CODEC({codec})"
     full_ttl = f"{ttl}, {new_rule}" if ttl else new_rule
     return [
-        f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY SETTING materialize_ttl_recalculate_only = true",
+        f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY SETTING "
+        "materialize_ttl_recalculate_only = true, merge_with_recompression_ttl_timeout = 1800",
         f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY TTL {full_ttl}",
     ]
 
