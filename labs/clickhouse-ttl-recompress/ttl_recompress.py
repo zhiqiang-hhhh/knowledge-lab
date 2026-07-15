@@ -229,15 +229,46 @@ def extract_column_types(create_query: str) -> dict[str, str]:
     return columns
 
 
-def is_date_like_type(column_type: str | None) -> bool:
+def normalized_column_type(column_type: str | None) -> str:
     if column_type is None:
-        return False
+        return ""
     normalized = column_type.lower()
-    if normalized.startswith("nullable(") and normalized.endswith(")"):
-        normalized = normalized[len("nullable(") : -1]
-    if normalized.startswith("lowcardinality(") and normalized.endswith(")"):
-        normalized = normalized[len("lowcardinality(") : -1]
+    while True:
+        if normalized.startswith("nullable(") and normalized.endswith(")"):
+            normalized = normalized[len("nullable(") : -1]
+            continue
+        if normalized.startswith("lowcardinality(") and normalized.endswith(")"):
+            normalized = normalized[len("lowcardinality(") : -1]
+            continue
+        return normalized
+
+
+def is_date_like_type(column_type: str | None) -> bool:
+    normalized = normalized_column_type(column_type)
     return normalized.startswith(("date", "datetime"))
+
+
+def is_datetime64_type(column_type: str | None) -> bool:
+    return normalized_column_type(column_type).startswith("datetime64")
+
+
+def ttl_compatible_expression(expression: str, column_types: dict[str, str]) -> str:
+    value = expression.strip()
+    call = split_function_call(value)
+    if call is not None:
+        function, arguments = call
+        normalized = function.lower()
+        first_argument = first_function_argument(arguments)
+        if normalized == "todatetime64":
+            return f"toDateTime({value})"
+        if normalized.startswith("tostartof") and first_argument:
+            argument_type = column_types.get(unquote_identifier(first_argument)) if is_simple_identifier(first_argument) else None
+            if is_datetime64_type(argument_type):
+                return f"toDateTime({value})"
+        return value
+    if is_simple_identifier(value) and is_datetime64_type(column_types.get(unquote_identifier(value))):
+        return f"toDateTime({value})"
+    return value
 
 
 def ttl_base_expression(partition_key: str, column_types: dict[str, str]) -> str | None:
@@ -247,7 +278,7 @@ def ttl_base_expression(partition_key: str, column_types: dict[str, str]) -> str
     call = split_function_call(value)
     if call is None:
         if is_simple_identifier(value) and is_date_like_type(column_types.get(unquote_identifier(value))):
-            return value
+            return ttl_compatible_expression(value, column_types)
         return None
     function, arguments = call
     normalized = function.lower()
@@ -261,9 +292,10 @@ def ttl_base_expression(partition_key: str, column_types: dict[str, str]) -> str
         "todayofmonth",
         "tohour",
     }:
-        return first_function_argument(arguments)
+        first_argument = first_function_argument(arguments)
+        return ttl_compatible_expression(first_argument, column_types) if first_argument else None
     if normalized.startswith("tostartof") or normalized in {"tomonday", "todate", "todatetime", "todatetime64"}:
-        return value
+        return ttl_compatible_expression(value, column_types)
     return None
 
 

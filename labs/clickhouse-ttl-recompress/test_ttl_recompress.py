@@ -46,6 +46,19 @@ class TtlRecompressTest(unittest.TestCase):
         partition_key = "toMonday(time + toIntervalDay(1))"
         self.assertEqual(ttl_base_expression(partition_key, {"time": "DateTime"}), partition_key)
 
+    def test_converts_datetime64_partition_key_to_datetime_for_ttl(self):
+        self.assertEqual(ttl_base_expression("event_time", {"event_time": "DateTime64(3)"}), "toDateTime(event_time)")
+
+    def test_converts_datetime64_partition_key_argument_to_datetime_for_ttl(self):
+        self.assertEqual(
+            ttl_base_expression("toYYYYMM(event_time)", {"event_time": "DateTime64(3)"}),
+            "toDateTime(event_time)",
+        )
+
+    def test_converts_todatetime64_partition_key_to_datetime_for_ttl(self):
+        partition_key = "toDateTime64(event_time_ms / 1000, 3)"
+        self.assertEqual(ttl_base_expression(partition_key, {}), f"toDateTime({partition_key})")
+
     def test_skips_tables_with_existing_ttl_move(self):
         table = Table("db", "t", "", "toMonday(time + toIntervalDay(1))", 100, 1024)
         ttl = "time TO VOLUME 'default', time + toIntervalDay(3) TO VOLUME 's3_disk'"
