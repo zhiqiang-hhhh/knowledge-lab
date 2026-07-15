@@ -15,10 +15,11 @@ python3 ttl_recompress.py \
   --host clickhouse.example.com \
   --databases analytics \
   --cluster production \
+  --no-materialize-ttl-after-modify \
   --apply
 ```
 
-每张表严格按顺序执行：
+默认并行提交 ALTER，并行度为 10，可用 `--apply-concurrency` 覆盖。每张表会执行：
 
 ```sql
 ALTER TABLE db.table ON CLUSTER production
@@ -29,7 +30,8 @@ ALTER TABLE db.table ON CLUSTER production
 ALTER TABLE db.table ON CLUSTER production
     MODIFY TTL
         <原有的完整 table TTL>,
-        <partition_key> + INTERVAL 1 WEEK RECOMPRESS CODEC(ZSTD);
+        <partition_key> + INTERVAL 1 WEEK RECOMPRESS CODEC(ZSTD)
+    SETTINGS materialize_ttl_after_modify = 0;
 ```
 
 注意：
@@ -41,6 +43,7 @@ ALTER TABLE db.table ON CLUSTER production
 - 已有任意 `RECOMPRESS` rule 的表会跳过。
 - RECOMPRESS 生效表达式固定为 `system.tables.partition_key + INTERVAL 1 WEEK`，不再接受命令行表达式。
 - 没有分区键的表会跳过。分区键必须是能够与 `INTERVAL 1 WEEK` 相加的 Date/DateTime 表达式；Tuple 等复合分区键不适用。
-- `materialize_ttl_recalculate_only` 只影响后续 `MATERIALIZE TTL` 的行为；这两条 ALTER 本身不会立即把历史 parts 全部重压缩。历史数据需要重算 TTL metadata 时，再单独、限流执行 `ALTER TABLE ... MATERIALIZE TTL`。
+- 压力较大的集群建议使用 `--no-materialize-ttl-after-modify`。该选项会在 `MODIFY TTL` 查询后追加 query-level `SETTINGS materialize_ttl_after_modify = 0`，让 `MODIFY TTL` 只修改 TTL 规则，不自动生成历史数据的 `MATERIALIZE TTL` mutation，避免历史 parts 被批量重写和重新压缩。
+- 未使用 `--no-materialize-ttl-after-modify` 时，脚本会在提交新的 TTL ALTER 前检查全局 `system.mutations` 中未完成的 `MATERIALIZE TTL` 数量；达到 10 个时每 5 秒等待一次。
 - `merge_with_recompression_ttl_timeout = 1800` 将同一 partition 再次调度 recompression TTL merge 的最小间隔固定为 30 分钟。
 - 对 ReplicatedMergeTree，如果所有 shard 上表结构一致，可使用 `ON CLUSTER`；否则应按 shard 分别执行。

@@ -25,14 +25,22 @@ class TtlRecompressTest(unittest.TestCase):
 
     def test_renders_setting_before_complete_ttl(self):
         table = Table("db", "t", "", "toStartOfWeek(ts)", 100, 1024)
-        statements = render_alters(table, "ts + INTERVAL 30 DAY DELETE", table.partition_key, "ZSTD", "prod")
+        statements = render_alters(table, "ts + INTERVAL 30 DAY DELETE", table.partition_key, "ZSTD", "prod", True)
         self.assertIn("MODIFY SETTING materialize_ttl_recalculate_only = true", statements[0])
         self.assertIn("merge_with_recompression_ttl_timeout = 1800", statements[0])
+        self.assertNotIn("materialize_ttl_after_modify", statements[0])
         self.assertIn(
             "TTL ts + INTERVAL 30 DAY DELETE, toStartOfWeek(ts) + INTERVAL 1 WEEK RECOMPRESS CODEC(ZSTD)",
             statements[1],
         )
         self.assertIn("ON CLUSTER `prod`", statements[1])
+
+    def test_can_disable_materialize_ttl_after_modify(self):
+        table = Table("db", "t", "", "ts", 100, 1024)
+        statements = render_alters(table, None, table.partition_key, "ZSTD", None, False)
+        self.assertNotIn("materialize_ttl_after_modify", statements[0])
+        self.assertIn("MODIFY TTL ts + INTERVAL 1 WEEK RECOMPRESS CODEC(ZSTD)", statements[1])
+        self.assertIn("SETTINGS materialize_ttl_after_modify = 0", statements[1])
 
     def test_accepts_tomonday_partition_key_with_interval_offset(self):
         partition_key = "toMonday(time + toIntervalDay(1))"

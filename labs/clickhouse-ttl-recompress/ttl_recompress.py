@@ -267,14 +267,24 @@ def ttl_base_expression(partition_key: str, column_types: dict[str, str]) -> str
     return None
 
 
-def render_alters(table: Table, ttl: str | None, ttl_base: str, codec: str, cluster: str | None) -> list[str]:
+def render_alters(
+    table: Table,
+    ttl: str | None,
+    ttl_base: str,
+    codec: str,
+    cluster: str | None,
+    materialize_ttl_after_modify: bool,
+) -> list[str]:
     on_cluster = f" ON CLUSTER {quote_ident(cluster)}" if cluster else ""
     new_rule = f"{ttl_base} + INTERVAL 1 WEEK RECOMPRESS CODEC({codec})"
     full_ttl = f"{ttl}, {new_rule}" if ttl else new_rule
+    ttl_statement = f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY TTL {full_ttl}"
+    if not materialize_ttl_after_modify:
+        ttl_statement += "\nSETTINGS materialize_ttl_after_modify = 0"
     return [
         f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY SETTING "
         "materialize_ttl_recalculate_only = true, merge_with_recompression_ttl_timeout = 1800",
-        f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY TTL {full_ttl}",
+        ttl_statement,
     ]
 
 
@@ -648,6 +658,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_APPLY_CONCURRENCY,
         help=f"Maximum tables to ALTER concurrently; default: {DEFAULT_APPLY_CONCURRENCY}",
     )
+    parser.add_argument(
+        "--no-materialize-ttl-after-modify",
+        dest="materialize_ttl_after_modify",
+        action="store_false",
+        default=True,
+        help="Add query SETTINGS materialize_ttl_after_modify = 0 to MODIFY TTL to avoid automatic historical TTL materialization",
+    )
     parser.add_argument("--apply", action="store_true", help="Execute the plan; default is dry-run")
     args = parser.parse_args(argv)
     if ";" in args.codec:
@@ -712,7 +729,14 @@ def main(argv: list[str]) -> int:
             skipped += 1
             continue
         assert ttl_base is not None
-        statements = render_alters(table, ttl, ttl_base, args.codec.strip(), args.cluster)
+        statements = render_alters(
+            table,
+            ttl,
+            ttl_base,
+            args.codec.strip(),
+            args.cluster,
+            args.materialize_ttl_after_modify,
+        )
         if index <= SUMMARY_TABLE_LIMIT:
             print_table_plan(index, table, ttl, ttl_base, statements, None)
         execution_plan.append((table, statements))
