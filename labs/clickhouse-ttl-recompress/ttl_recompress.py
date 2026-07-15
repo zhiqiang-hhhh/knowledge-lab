@@ -22,7 +22,9 @@ except ModuleNotFoundError:  # Allow --help without the optional dependency.
 SYSTEM_DATABASES = {"system", "INFORMATION_SCHEMA", "information_schema"}
 SUMMARY_TABLE_LIMIT = 20
 DEFAULT_METADATA_BATCH_SIZE = 50
-DEFAULT_APPLY_CONCURRENCY = 1
+DEFAULT_APPLY_CONCURRENCY = 10
+DEFAULT_MAX_ACTIVE_MATERIALIZE_TTL = 10
+DEFAULT_MATERIALIZE_TTL_POLL_SECONDS = 5
 _APPLY_THREAD_LOCAL = threading.local()
 
 
@@ -120,6 +122,10 @@ def extract_ttl(create_query: str) -> str | None:
 
 def has_recompress(ttl: str) -> bool:
     return re.search(r"\bRECOMPRESS\b", ttl, re.IGNORECASE) is not None
+
+
+def has_ttl_move(ttl: str) -> bool:
+    return re.search(r"\bTO\s+(?:VOLUME|DISK)\b", ttl, re.IGNORECASE) is not None
 
 
 def split_function_call(expression: str) -> tuple[str, str] | None:
@@ -256,7 +262,7 @@ def ttl_base_expression(partition_key: str, column_types: dict[str, str]) -> str
         "tohour",
     }:
         return first_function_argument(arguments)
-    if normalized.startswith("tostartof") or normalized in {"todate", "todatetime", "todatetime64"}:
+    if normalized.startswith("tostartof") or normalized in {"tomonday", "todate", "todatetime", "todatetime64"}:
         return value
     return None
 
@@ -473,6 +479,8 @@ def skip_reason(table: Table, ttl: str | None, ttl_base: str | None) -> str | No
         return "empty partition key"
     if ttl and has_recompress(ttl):
         return "already has TTL RECOMPRESS"
+    if ttl and has_ttl_move(ttl):
+        return "already has TTL MOVE"
     if ttl_base is None:
         return "unsupported partition key for TTL base expression"
     return None
@@ -501,6 +509,29 @@ def print_table_plan(
     print()
 
 
+def active_materialize_ttl_mutations(client) -> int:
+    query = """
+        SELECT count()
+        FROM system.mutations
+        WHERE is_done = 0
+          AND positionCaseInsensitive(command, 'MATERIALIZE TTL') > 0
+    """
+    result = client.query(textwrap.dedent(query).strip())
+    return int(result.result_rows[0][0])
+
+
+def wait_for_materialize_ttl_capacity(client, max_active: int, poll_seconds: int) -> None:
+    while True:
+        active = active_materialize_ttl_mutations(client)
+        if active < max_active:
+            return
+        log(
+            "stage=apply status=waiting-materialize-ttl "
+            f"active={active} limit={max_active} poll_seconds={poll_seconds}"
+        )
+        time.sleep(poll_seconds)
+
+
 def apply_table(client, index: int, total: int, table: Table, statements: list[str], log_queries: bool) -> None:
     name = f"{table.database}.{table.name}"
     log(f"stage=apply status=setting-started table={index}/{total} name={name}")
@@ -512,6 +543,11 @@ def apply_table(client, index: int, total: int, table: Table, statements: list[s
         log(f"stage=apply status=setting-failed table={index}/{total} name={name} error={error}")
         raise
     log(f"stage=apply status=setting-completed table={index}/{total} name={name}")
+    wait_for_materialize_ttl_capacity(
+        client,
+        DEFAULT_MAX_ACTIVE_MATERIALIZE_TTL,
+        DEFAULT_MATERIALIZE_TTL_POLL_SECONDS,
+    )
     log(f"stage=apply status=ttl-started table={index}/{total} name={name}")
     if log_queries:
         log_sql("apply", statements[1])
