@@ -79,3 +79,37 @@ MergedBlockOutputStream::finalizePartOnDisk(new_part, checksums)
     }
 }
 ```
+
+### ColumnDepency
+
+```cpp
+ColumnDependency(const String & column_name_, Kind kind_)
+        : column_name(column_name_), kind(kind_) {}
+```
+描述 column_name_ 是某个其他XXX的依赖。XXX 就是 Kind 这个 enum 里面区分的类型：
+```cpp
+enum Kind : UInt8
+{
+    /// Exists any skip index, that requires @column_name
+    SKIP_INDEX,
+
+    /// Exists any projection, that requires @column_name
+    PROJECTION,
+
+    /// Exists any TTL expression, that requires @column_name
+    TTL_EXPRESSION,
+
+    /// TTL is set for @column_name.
+    TTL_TARGET,
+
+    /// Exists any statistics, that requires @column_name
+    STATISTICS,
+};
+```
+注释很清楚了。
+
+ColumnDependency 与 TTL 的关系：
+
+TTL 依赖某个表达式来决定某行/某个part是否“过期“。当判断某个 TTL 条件是否满足的时候，我们需要去读对应的列，后续还可能需要去更新某些列，因此需要用 `ColumnDepencency` 来记录和描述上述信息。
+
+### void MutationsInterpreter::prepare(bool dry_run)
