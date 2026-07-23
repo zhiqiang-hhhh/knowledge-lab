@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import sys
@@ -25,6 +25,11 @@ DEFAULT_METADATA_BATCH_SIZE = 50
 DEFAULT_APPLY_CONCURRENCY = 10
 DEFAULT_MAX_ACTIVE_MATERIALIZE_TTL = 10
 DEFAULT_MATERIALIZE_TTL_POLL_SECONDS = 5
+DEFAULT_SKIPPED_SUMMARY_LIMIT = 20
+DEFAULT_SKIPPED_SUMMARY_SCAN_LIMIT = 1000
+REQUIRED_TABLE_SETTINGS = {
+    "materialize_ttl_recalculate_only": {"1", "true"},
+}
 _APPLY_THREAD_LOCAL = threading.local()
 
 
@@ -36,6 +41,9 @@ class Table:
     partition_key: str
     total_rows: int
     total_bytes: int
+    local_bytes: int = 0
+    remote_bytes: int = 0
+    storage_policy: str = "default"
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,8 @@ class RankedTable:
     name: str
     total_rows: int
     total_bytes: int
+    local_bytes: int = 0
+    remote_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -52,6 +62,19 @@ class PlannedTable:
     ttl: str | None
     ttl_base: str | None
     reason: str | None
+
+
+@dataclass(frozen=True)
+class RepairSettingPlan:
+    tables: list[Table]
+    recompress_tables: list[Table]
+    repair_tables: list[Table]
+
+
+@dataclass(frozen=True)
+class StorageTopology:
+    remote_disks: frozenset[str]
+    volume_disks: dict[tuple[str, str], tuple[str, ...]]
 
 
 def quote_ident(value: str) -> str:
@@ -128,6 +151,29 @@ def has_ttl_move(ttl: str) -> bool:
     return re.search(r"\bTO\s+(?:VOLUME|DISK)\b", ttl, re.IGNORECASE) is not None
 
 
+def ttl_move_targets(ttl: str | None) -> list[tuple[str, str]]:
+    if not ttl:
+        return []
+    pattern = re.compile(
+        r"\bTO\s+(VOLUME|DISK)\s+(?:'((?:\\.|[^'])*)'|\"((?:\\.|[^\"])*)\"|`([^`]+)`|([A-Za-z_][A-Za-z0-9_]*))",
+        re.IGNORECASE,
+    )
+    targets: list[tuple[str, str]] = []
+    for match in pattern.finditer(ttl):
+        value = next(group for group in match.groups()[1:] if group is not None)
+        targets.append((match.group(1).lower(), value))
+    return targets
+
+
+def has_ttl_delete(ttl: str) -> bool:
+    for rule in split_top_level_csv(ttl):
+        if re.search(r"\bDELETE\b", rule, re.IGNORECASE):
+            return True
+        if not re.search(r"\bTO\s+(?:VOLUME|DISK)\b|\bRECOMPRESS\b|\bGROUP\s+BY\b", rule, re.IGNORECASE):
+            return True
+    return False
+
+
 def split_function_call(expression: str) -> tuple[str, str] | None:
     expression = expression.strip()
     match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression)
@@ -174,6 +220,34 @@ def first_function_argument(arguments: str) -> str | None:
             return value or None
     value = arguments.strip()
     return value or None
+
+
+def split_top_level_csv(value: str) -> list[str]:
+    items: list[str] = []
+    depth = 0
+    quote = ""
+    start = 0
+    for index, char in enumerate(value):
+        if quote:
+            if char == "\\":
+                continue
+            if char == quote:
+                quote = ""
+        elif char in "'\"`":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            item = value[start:index].strip()
+            if item:
+                items.append(item)
+            start = index + 1
+    item = value[start:].strip()
+    if item:
+        items.append(item)
+    return items
 
 
 def unquote_identifier(value: str) -> str:
@@ -252,6 +326,18 @@ def is_datetime64_type(column_type: str | None) -> bool:
     return normalized_column_type(column_type).startswith("datetime64")
 
 
+def expression_references_column(expression: str, column: str) -> bool:
+    escaped = re.escape(column)
+    return re.search(rf"(?<![A-Za-z0-9_`])`?{escaped}`?(?![A-Za-z0-9_`])", expression) is not None
+
+
+def expression_references_datetime64(expression: str, column_types: dict[str, str]) -> bool:
+    return any(
+        is_datetime64_type(column_type) and expression_references_column(expression, column)
+        for column, column_type in column_types.items()
+    )
+
+
 def ttl_compatible_expression(expression: str, column_types: dict[str, str]) -> str:
     value = expression.strip()
     call = split_function_call(value)
@@ -261,10 +347,8 @@ def ttl_compatible_expression(expression: str, column_types: dict[str, str]) -> 
         first_argument = first_function_argument(arguments)
         if normalized == "todatetime64":
             return f"toDateTime({value})"
-        if normalized.startswith("tostartof") and first_argument:
-            argument_type = column_types.get(unquote_identifier(first_argument)) if is_simple_identifier(first_argument) else None
-            if is_datetime64_type(argument_type):
-                return f"toDateTime({value})"
+        if expression_references_datetime64(arguments, column_types):
+            return f"toDateTime({value})"
         return value
     if is_simple_identifier(value) and is_datetime64_type(column_types.get(unquote_identifier(value))):
         return f"toDateTime({value})"
@@ -299,6 +383,41 @@ def ttl_base_expression(partition_key: str, column_types: dict[str, str]) -> str
     return None
 
 
+def normalize_setting_value(value: str) -> str:
+    value = value.strip().rstrip(";")
+    if (value.startswith("'") and value.endswith("'")) or (value.startswith('"') and value.endswith('"')):
+        value = value[1:-1]
+    return value.strip().lower()
+
+
+def extract_table_settings(create_query: str) -> dict[str, str]:
+    settings = find_keyword(create_query, "SETTINGS")
+    if settings < 0:
+        return {}
+    body = create_query[settings + len("SETTINGS") :].strip()
+    parsed: dict[str, str] = {}
+    for item in split_top_level_csv(body):
+        match = re.match(r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*(.+)$", item.strip())
+        if not match:
+            continue
+        parsed[match.group(1).lower()] = normalize_setting_value(match.group(2))
+    return parsed
+
+
+def required_table_settings_satisfied(create_query: str) -> bool:
+    settings = extract_table_settings(create_query)
+    return all(settings.get(name) in values for name, values in REQUIRED_TABLE_SETTINGS.items())
+
+
+def materialize_ttl_recalculate_only_enabled(create_query: str) -> bool:
+    return extract_table_settings(create_query).get("materialize_ttl_recalculate_only") in {"1", "true"}
+
+
+def should_materialize_ttl_after_modify(ttl: str | None, configured: bool) -> bool:
+    """Never auto-materialize a modified TTL for tables with MOVE rules."""
+    return configured and not (ttl and has_ttl_move(ttl))
+
+
 def render_alters(
     table: Table,
     ttl: str | None,
@@ -308,16 +427,20 @@ def render_alters(
     materialize_ttl_after_modify: bool,
 ) -> list[str]:
     on_cluster = f" ON CLUSTER {quote_ident(cluster)}" if cluster else ""
-    new_rule = f"{ttl_base} + INTERVAL 1 WEEK RECOMPRESS CODEC({codec})"
+    recompress_interval = "1 DAY" if ttl and has_ttl_move(ttl) else "1 WEEK"
+    new_rule = f"{ttl_base} + INTERVAL {recompress_interval} RECOMPRESS CODEC({codec})"
     full_ttl = f"{ttl}, {new_rule}" if ttl else new_rule
     ttl_statement = f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY TTL {full_ttl}"
-    if not materialize_ttl_after_modify:
+    if not should_materialize_ttl_after_modify(ttl, materialize_ttl_after_modify):
         ttl_statement += "\nSETTINGS materialize_ttl_after_modify = 0"
-    return [
-        f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY SETTING "
-        "materialize_ttl_recalculate_only = true, merge_with_recompression_ttl_timeout = 1800",
-        ttl_statement,
-    ]
+    statements = []
+    if not required_table_settings_satisfied(table.create_query):
+        statements.append(
+            f"ALTER TABLE {qualified(table)}{on_cluster} MODIFY SETTING "
+            "materialize_ttl_recalculate_only = true"
+        )
+    statements.append(ttl_statement)
+    return statements
 
 
 def csv_values(value: str | None) -> list[str]:
@@ -343,28 +466,31 @@ def get_apply_client(args: argparse.Namespace):
 
 
 def fetch_ranked_tables(client, args: argparse.Namespace) -> list[RankedTable]:
-    conditions = ["active"]
+    conditions = ["p.active"]
     databases = csv_values(args.databases)
     if databases:
-        conditions.append("database IN (" + ", ".join(map(quote_literal, databases)) + ")")
-    else:
-        conditions.append("database NOT IN (" + ", ".join(map(quote_literal, sorted(SYSTEM_DATABASES))) + ")")
+        conditions.append("p.database IN (" + ", ".join(map(quote_literal, databases)) + ")")
+    elif not getattr(args, "include_system", False):
+        conditions.append("p.database NOT IN (" + ", ".join(map(quote_literal, sorted(SYSTEM_DATABASES))) + ")")
     tables = csv_values(args.tables)
     if tables:
-        conditions.append("`table` IN (" + ", ".join(map(quote_literal, tables)) + ")")
+        conditions.append("p.`table` IN (" + ", ".join(map(quote_literal, tables)) + ")")
     limit_clause = "" if args.all else f"\n        LIMIT {args.limit}"
     query = (
         """
         SELECT
-            database,
-            `table`,
-            sum(rows) AS total_rows,
-            sum(bytes) AS total_bytes
-        FROM system.parts
+            p.database,
+            p.`table`,
+            sum(p.rows) AS total_rows,
+            sum(p.bytes) AS total_bytes,
+            sumIf(p.bytes, d.is_remote = 0) AS local_bytes,
+            sumIf(p.bytes, d.is_remote = 1) AS remote_bytes
+        FROM system.parts AS p
+        LEFT JOIN system.disks AS d ON p.disk_name = d.name
         WHERE """
         + " AND ".join(conditions)
         + f"""
-        GROUP BY database, `table`
+        GROUP BY p.database, p.`table`
         ORDER BY total_bytes DESC"""
         + limit_clause
         + """
@@ -374,7 +500,14 @@ def fetch_ranked_tables(client, args: argparse.Namespace) -> list[RankedTable]:
     log_sql("fetch_parts", query)
     result = client.query(query)
     return [
-        RankedTable(str(row[0]), str(row[1]), int(row[2]), int(row[3]))
+        RankedTable(
+            str(row[0]),
+            str(row[1]),
+            int(row[2]),
+            int(row[3]),
+            int(row[4]) if len(row) > 4 else int(row[3]),
+            int(row[5]) if len(row) > 5 else 0,
+        )
         for row in result.result_rows
     ]
 
@@ -388,15 +521,25 @@ def fetch_metadata_batch(
     client,
     database: str,
     names: list[str],
+    include_system: bool = False,
     log_query: bool = False,
-) -> dict[tuple[str, str], tuple[str, str]]:
+) -> dict[tuple[str, str], tuple[str, str, str]]:
+    system_filter = ""
+    if not include_system:
+        system_filter = (
+            """
+          AND database NOT IN ("""
+            + ", ".join(map(quote_literal, sorted(SYSTEM_DATABASES)))
+            + """)"""
+        )
     query = (
         """
         SELECT
             database,
             name,
             create_table_query,
-            partition_key
+            partition_key,
+            storage_policy
         FROM system.tables
         WHERE database = """
         + quote_literal(database)
@@ -404,9 +547,9 @@ def fetch_metadata_batch(
           AND name IN ("""
         + ", ".join(map(quote_literal, names))
         + """)
-          AND database NOT IN ("""
-        + ", ".join(map(quote_literal, sorted(SYSTEM_DATABASES)))
-        + """)
+        """
+        + system_filter
+        + """
           AND engine LIKE '%MergeTree%'
         """
     )
@@ -415,17 +558,26 @@ def fetch_metadata_batch(
         log_sql("fetch_metadata", query)
     result = client.query(query)
     return {
-        (str(row[0]), str(row[1])): (str(row[2]), str(row[3]))
+        (str(row[0]), str(row[1])): (
+            str(row[2]),
+            str(row[3]),
+            str(row[4]) if len(row) > 4 else "default",
+        )
         for row in result.result_rows
     }
 
 
-def fetch_table_metadata(client, ranked: list[RankedTable], batch_size: int) -> dict[tuple[str, str], tuple[str, str]]:
+def fetch_table_metadata(
+    client,
+    ranked: list[RankedTable],
+    batch_size: int,
+    include_system: bool = False,
+) -> dict[tuple[str, str], tuple[str, str, str]]:
     grouped: dict[str, list[str]] = defaultdict(list)
     for table in ranked:
         grouped[table.database].append(table.name)
 
-    metadata: dict[tuple[str, str], tuple[str, str]] = {}
+    metadata: dict[tuple[str, str], tuple[str, str, str]] = {}
     chunk_index = 0
     total_chunks = sum((len(names) + batch_size - 1) // batch_size for names in grouped.values())
     for database, names in grouped.items():
@@ -440,6 +592,7 @@ def fetch_table_metadata(client, ranked: list[RankedTable], batch_size: int) -> 
                     client,
                     database,
                     chunk,
+                    include_system=include_system,
                     log_query=chunk_index <= SUMMARY_TABLE_LIMIT,
                 )
             )
@@ -452,7 +605,12 @@ def fetch_table_metadata(client, ranked: list[RankedTable], batch_size: int) -> 
 
 def fetch_tables(client, args: argparse.Namespace) -> list[Table]:
     ranked = fetch_ranked_tables(client, args)
-    metadata = fetch_table_metadata(client, ranked, args.metadata_batch_size)
+    metadata = fetch_table_metadata(
+        client,
+        ranked,
+        args.metadata_batch_size,
+        include_system=getattr(args, "include_system", False),
+    )
     tables: list[Table] = []
     for index, table in enumerate(ranked, start=1):
         name = f"{table.database}.{table.name}"
@@ -460,7 +618,7 @@ def fetch_tables(client, args: argparse.Namespace) -> list[Table]:
         if details is None:
             log(f"stage=fetch_metadata status=skipped table={index}/{len(ranked)} name={name} reason=not MergeTree or missing metadata")
             continue
-        create_query, partition_key = details
+        create_query, partition_key, storage_policy = details
         tables.append(
             Table(
                 table.database,
@@ -469,9 +627,105 @@ def fetch_tables(client, args: argparse.Namespace) -> list[Table]:
                 partition_key,
                 table.total_rows,
                 table.total_bytes,
+                table.local_bytes,
+                table.remote_bytes,
+                storage_policy,
             )
         )
     return tables
+
+
+def fetch_storage_topology(client) -> StorageTopology:
+    disks_query = "SELECT name, is_remote FROM system.disks"
+    policies_query = "SELECT policy_name, volume_name, disks FROM system.storage_policies"
+    log_sql("fetch_storage_topology", disks_query)
+    disk_rows = client.query(disks_query).result_rows
+    log_sql("fetch_storage_topology", policies_query)
+    policy_rows = client.query(policies_query).result_rows
+    return StorageTopology(
+        remote_disks=frozenset(str(row[0]) for row in disk_rows if int(row[1]) == 1),
+        volume_disks={
+            (str(row[0]), str(row[1])): tuple(str(disk) for disk in row[2])
+            for row in policy_rows
+        },
+    )
+
+
+def fetch_repair_setting_tables(client, args: argparse.Namespace) -> list[Table]:
+    conditions = ["engine LIKE '%MergeTree%'"]
+    databases = csv_values(args.databases)
+    if databases:
+        conditions.append("database IN (" + ", ".join(map(quote_literal, databases)) + ")")
+    else:
+        conditions.append("database NOT IN (" + ", ".join(map(quote_literal, sorted(SYSTEM_DATABASES))) + ")")
+    tables = csv_values(args.tables)
+    if tables:
+        conditions.append("name IN (" + ", ".join(map(quote_literal, tables)) + ")")
+    query = textwrap.dedent(
+        f"""
+        SELECT
+            database,
+            name
+        FROM system.tables
+        WHERE {' AND '.join(conditions)}
+        ORDER BY database, name
+        """
+    ).strip()
+    log_sql("fetch_repair_setting", query)
+    result = client.query(query)
+    ranked = [RankedTable(str(row[0]), str(row[1]), 0, 0) for row in result.result_rows]
+    log(
+        "stage=fetch_repair_setting_metadata status=started "
+        f"tables={len(ranked)} batch_size={args.metadata_batch_size}"
+    )
+    metadata = fetch_table_metadata(
+        client,
+        ranked,
+        args.metadata_batch_size,
+        include_system=True,
+    )
+    log(f"stage=fetch_repair_setting_metadata status=completed tables={len(metadata)}")
+    return [
+        Table(table.database, table.name, details[0], details[1], 0, 0)
+        for table in ranked
+        if (details := metadata.get((table.database, table.name))) is not None
+    ]
+
+
+def plan_repair_settings(tables: list[Table]) -> RepairSettingPlan:
+    recompress_tables = [
+        table
+        for table in tables
+        if (ttl := extract_ttl(table.create_query)) is not None and has_recompress(ttl)
+    ]
+    repair_tables = [
+        table
+        for table in recompress_tables
+        if not materialize_ttl_recalculate_only_enabled(table.create_query)
+    ]
+    return RepairSettingPlan(tables, recompress_tables, repair_tables)
+
+
+def render_repair_setting_alter(table: Table, cluster: str | None) -> str:
+    on_cluster = f" ON CLUSTER {quote_ident(cluster)}" if cluster else ""
+    return (
+        f"ALTER TABLE {qualified(table)}{on_cluster} "
+        "MODIFY SETTING materialize_ttl_recalculate_only = true"
+    )
+
+
+def print_repair_setting_analysis(plan: RepairSettingPlan, cluster: str | None) -> None:
+    satisfied = len(plan.recompress_tables) - len(plan.repair_tables)
+    print("Repair-setting analysis:")
+    print(f"  scanned MergeTree tables: {len(plan.tables)}")
+    print(f"  tables with TTL RECOMPRESS: {len(plan.recompress_tables)}")
+    print(f"  repair needed: {len(plan.repair_tables)}")
+    print(f"  already enabled: {satisfied}")
+    print()
+    for index, table in enumerate(plan.repair_tables, start=1):
+        print(f"-- repair-setting [{index}] {table.database}.{table.name}")
+        print(render_repair_setting_alter(table, cluster) + ";")
+        print()
 
 
 def print_table_summary(title: str, tables: list[Table], limit: int = SUMMARY_TABLE_LIMIT) -> None:
@@ -487,6 +741,193 @@ def print_table_summary(title: str, tables: list[Table], limit: int = SUMMARY_TA
     print()
 
 
+def summarize_planned_tables(planned_tables: list[PlannedTable]) -> dict[str, int]:
+    eligible = [planned for planned in planned_tables if planned.reason is None]
+    skipped = [planned for planned in planned_tables if planned.reason is not None]
+    return {
+        "selected_tables": len(planned_tables),
+        "eligible_tables": len(eligible),
+        "skipped_tables": len(skipped),
+        "selected_rows": sum(planned.table.total_rows for planned in planned_tables),
+        "eligible_rows": sum(planned.table.total_rows for planned in eligible),
+        "skipped_rows": sum(planned.table.total_rows for planned in skipped),
+        "selected_bytes": sum(planned.table.total_bytes for planned in planned_tables),
+        "eligible_bytes": sum(planned.table.total_bytes for planned in eligible),
+        "skipped_bytes": sum(planned.table.total_bytes for planned in skipped),
+        "eligible_local_bytes": sum(planned.table.local_bytes for planned in eligible),
+        "eligible_remote_bytes": sum(planned.table.remote_bytes for planned in eligible),
+    }
+
+
+def classify_ttl_storage(planned: PlannedTable, topology: StorageTopology) -> str:
+    targets = ttl_move_targets(planned.ttl)
+    if not targets:
+        return "local-only"
+    resolved_disks: list[str] = []
+    unresolved = False
+    for kind, target in targets:
+        if kind == "disk":
+            resolved_disks.append(target)
+            unresolved |= target not in topology.remote_disks and not any(
+                target in disks for disks in topology.volume_disks.values()
+            )
+            continue
+        disks = topology.volume_disks.get((planned.table.storage_policy, target))
+        if disks is None:
+            unresolved = True
+        else:
+            resolved_disks.extend(disks)
+    if any(disk in topology.remote_disks for disk in resolved_disks):
+        return "s3-remote-move"
+    if unresolved:
+        return "unresolved-move"
+    return "local-volume-move"
+
+
+def print_storage_table_summary(
+    title: str,
+    planned_tables: list[PlannedTable],
+    limit: int = SUMMARY_TABLE_LIMIT,
+) -> None:
+    print(title)
+    for index, planned in enumerate(planned_tables[:limit], start=1):
+        table = planned.table
+        print(
+            f"  {index}. {table.database}.{table.name} rows={table.total_rows} "
+            f"local_bytes={table.local_bytes} ({format_bytes(table.local_bytes)}) "
+            f"remote_bytes={table.remote_bytes} ({format_bytes(table.remote_bytes)}) "
+            f"total_bytes={table.total_bytes} ({format_bytes(table.total_bytes)})"
+        )
+    if len(planned_tables) > limit:
+        print(f"  ... omitted {len(planned_tables) - limit} more tables")
+    print()
+
+
+def print_skipped_table_summary(planned_tables: list[PlannedTable], limit: int = SUMMARY_TABLE_LIMIT) -> None:
+    skipped_tables = [planned for planned in planned_tables if planned.reason is not None]
+    if not skipped_tables:
+        return
+    print(f"Top skipped tables by bytes (showing={min(len(skipped_tables), limit)}):")
+    for index, planned in enumerate(skipped_tables[:limit], start=1):
+        table = planned.table
+        print(
+            f"  {index}. {table.database}.{table.name} "
+            f"rows={table.total_rows} bytes={table.total_bytes} ({format_bytes(table.total_bytes)}) "
+            f"reason={planned.reason}"
+        )
+    if len(skipped_tables) > limit:
+        print(f"  ... omitted {len(skipped_tables) - limit} more tables")
+    print()
+
+
+def print_analysis(
+    planned_tables: list[PlannedTable],
+    skipped_summary_plan: list[PlannedTable] | None = None,
+    limit: int = SUMMARY_TABLE_LIMIT,
+    topology: StorageTopology | None = None,
+) -> None:
+    summary = summarize_planned_tables(planned_tables)
+    print("Analysis summary:")
+    print(
+        "  selected: "
+        f"tables={summary['selected_tables']} rows={summary['selected_rows']} "
+        f"bytes={summary['selected_bytes']} ({format_bytes(summary['selected_bytes'])})"
+    )
+    print(
+        "  eligible: "
+        f"tables={summary['eligible_tables']} rows={summary['eligible_rows']} "
+        f"bytes={summary['eligible_bytes']} ({format_bytes(summary['eligible_bytes'])})"
+    )
+    print(
+        "  skipped: "
+        f"tables={summary['skipped_tables']} rows={summary['skipped_rows']} "
+        f"bytes={summary['skipped_bytes']} ({format_bytes(summary['skipped_bytes'])})"
+    )
+    print()
+
+    topology = topology or StorageTopology(frozenset(), {})
+    eligible = [planned for planned in planned_tables if planned.reason is None]
+    classified = defaultdict(list)
+    for planned in eligible:
+        classified[classify_ttl_storage(planned, topology)].append(planned)
+    local_only = classified["local-only"]
+    local_volume_move = classified["local-volume-move"]
+    s3_remote_move = classified["s3-remote-move"]
+    unresolved_move = classified["unresolved-move"]
+    local_only_local_bytes = sum(planned.table.local_bytes for planned in local_only)
+    local_move_local_bytes = sum(planned.table.local_bytes for planned in local_volume_move)
+    s3_move_local_bytes = sum(planned.table.local_bytes for planned in s3_remote_move)
+    s3_move_remote_bytes = sum(planned.table.remote_bytes for planned in s3_remote_move)
+    unresolved_local_bytes = sum(planned.table.local_bytes for planned in unresolved_move)
+    print("Local disk impact:")
+    print(
+        f"  local-only: tables={len(local_only)} "
+        f"local_bytes={local_only_local_bytes} ({format_bytes(local_only_local_bytes)})"
+    )
+    print(
+        f"  local-volume-move: tables={len(local_volume_move)} "
+        f"local_bytes={local_move_local_bytes} ({format_bytes(local_move_local_bytes)})"
+    )
+    print(
+        f"  S3/remote-move: tables={len(s3_remote_move)} "
+        f"local_bytes={s3_move_local_bytes} ({format_bytes(s3_move_local_bytes)}) "
+        f"remote_bytes={s3_move_remote_bytes} ({format_bytes(s3_move_remote_bytes)})"
+    )
+    if unresolved_move:
+        print(
+            f"  unresolved-move: tables={len(unresolved_move)} "
+            f"local_bytes={unresolved_local_bytes} ({format_bytes(unresolved_local_bytes)})"
+        )
+    print(
+        "  total eligible local disk bytes: "
+        f"{summary['eligible_local_bytes']} ({format_bytes(summary['eligible_local_bytes'])})"
+    )
+    print(
+        "  exact disk savings: unknown until ZSTD recompression completes; "
+        "the value above is the current local data footprint eligible for recompression"
+    )
+    print()
+
+    reason_counts = Counter(planned.reason for planned in planned_tables if planned.reason is not None)
+    if reason_counts:
+        print("Skip reasons:")
+        for reason, count in reason_counts.most_common():
+            reason_bytes = sum(
+                planned.table.total_bytes
+                for planned in planned_tables
+                if planned.reason == reason
+            )
+            print(f"  {reason}: tables={count} bytes={reason_bytes} ({format_bytes(reason_bytes)})")
+        print()
+
+    if local_only:
+        print_storage_table_summary(
+            f"Top eligible local-only tables by bytes (showing={min(len(local_only), limit)}):",
+            local_only,
+            limit,
+        )
+    if local_volume_move:
+        print_storage_table_summary(
+            f"Top eligible local-volume-move tables by bytes (showing={min(len(local_volume_move), limit)}):",
+            local_volume_move,
+            limit,
+        )
+    if s3_remote_move:
+        print_storage_table_summary(
+            f"Top eligible S3/remote-move tables by bytes (showing={min(len(s3_remote_move), limit)}):",
+            s3_remote_move,
+            limit,
+        )
+    if unresolved_move:
+        print_storage_table_summary(
+            f"Top eligible unresolved-move tables by bytes (showing={min(len(unresolved_move), limit)}):",
+            unresolved_move,
+            limit,
+        )
+
+    print_skipped_table_summary(skipped_summary_plan or planned_tables, limit)
+
+
 def plan_tables(tables: list[Table]) -> list[PlannedTable]:
     return [
         PlannedTable(table, ttl, ttl_base, skip_reason(table, ttl, ttl_base))
@@ -494,6 +935,38 @@ def plan_tables(tables: list[Table]) -> list[PlannedTable]:
         for ttl in [extract_ttl(table.create_query)]
         for ttl_base in [ttl_base_expression(table.partition_key, extract_column_types(table.create_query))]
     ]
+
+
+def skipped_table_count(planned_tables: list[PlannedTable]) -> int:
+    return sum(1 for planned in planned_tables if planned.reason is not None)
+
+
+def collect_skipped_summary_plan(client, args: argparse.Namespace, planned_tables: list[PlannedTable]) -> list[PlannedTable]:
+    if args.all or skipped_table_count(planned_tables) >= DEFAULT_SKIPPED_SUMMARY_LIMIT:
+        return planned_tables
+
+    scan_limit = args.limit
+    best_plan = planned_tables
+    while skipped_table_count(best_plan) < DEFAULT_SKIPPED_SUMMARY_LIMIT:
+        next_limit = min(scan_limit * 2, DEFAULT_SKIPPED_SUMMARY_SCAN_LIMIT)
+        if next_limit <= scan_limit:
+            break
+        summary_args = argparse.Namespace(**vars(args))
+        summary_args.limit = next_limit
+        log(
+            "stage=skipped_summary status=fetching "
+            f"limit={next_limit} target_skipped={DEFAULT_SKIPPED_SUMMARY_LIMIT}"
+        )
+        tables = fetch_tables(client, summary_args)
+        best_plan = plan_tables(tables)
+        log(
+            "stage=skipped_summary status=fetched "
+            f"selected={len(best_plan)} skipped={skipped_table_count(best_plan)}"
+        )
+        scan_limit = next_limit
+        if len(best_plan) < scan_limit:
+            break
+    return best_plan
 
 
 def format_bytes(size: int) -> str:
@@ -516,13 +989,19 @@ def log_sql(stage: str, sql: str) -> None:
     log(f"stage={stage} sql=\n{normalized}{suffix}")
 
 
+def is_setting_alter(statement: str) -> bool:
+    return re.search(r"\bMODIFY\s+SETTING\b", statement, re.IGNORECASE) is not None
+
+
 def skip_reason(table: Table, ttl: str | None, ttl_base: str | None) -> str | None:
+    if table.database in SYSTEM_DATABASES:
+        return "system database"
     if not table.partition_key.strip():
         return "empty partition key"
     if ttl and has_recompress(ttl):
         return "already has TTL RECOMPRESS"
-    if ttl and has_ttl_move(ttl):
-        return "already has TTL MOVE"
+    if not ttl or not has_ttl_delete(ttl):
+        return "no table TTL DELETE"
     if ttl_base is None:
         return "unsupported partition key for TTL base expression"
     return None
@@ -546,8 +1025,12 @@ def print_table_plan(
         print(f"-- skip reason: {reason}")
     else:
         assert statements is not None
-        print(f"-- planned setting: {statements[0]}")
-        print(f"-- planned TTL: {statements[1]}")
+        setting_statement = next((statement for statement in statements if is_setting_alter(statement)), None)
+        if setting_statement:
+            print(f"-- planned setting: {setting_statement}")
+        else:
+            print("-- planned setting: (already satisfied; skipped)")
+        print(f"-- planned TTL: {statements[-1]}")
     print()
 
 
@@ -576,25 +1059,30 @@ def wait_for_materialize_ttl_capacity(client, max_active: int, poll_seconds: int
 
 def apply_table(client, index: int, total: int, table: Table, statements: list[str], log_queries: bool) -> None:
     name = f"{table.database}.{table.name}"
-    log(f"stage=apply status=setting-started table={index}/{total} name={name}")
-    if log_queries:
-        log_sql("apply", statements[0])
-    try:
-        client.command(statements[0])
-    except Exception as error:
-        log(f"stage=apply status=setting-failed table={index}/{total} name={name} error={error}")
-        raise
-    log(f"stage=apply status=setting-completed table={index}/{total} name={name}")
+    setting_statement = next((statement for statement in statements if is_setting_alter(statement)), None)
+    if setting_statement:
+        log(f"stage=apply status=setting-started table={index}/{total} name={name}")
+        if log_queries:
+            log_sql("apply", setting_statement)
+        try:
+            client.command(setting_statement)
+        except Exception as error:
+            log(f"stage=apply status=setting-failed table={index}/{total} name={name} error={error}")
+            raise
+        log(f"stage=apply status=setting-completed table={index}/{total} name={name}")
+    else:
+        log(f"stage=apply status=setting-skipped table={index}/{total} name={name} reason=already-satisfied")
     wait_for_materialize_ttl_capacity(
         client,
         DEFAULT_MAX_ACTIVE_MATERIALIZE_TTL,
         DEFAULT_MATERIALIZE_TTL_POLL_SECONDS,
     )
     log(f"stage=apply status=ttl-started table={index}/{total} name={name}")
+    ttl_statement = statements[-1]
     if log_queries:
-        log_sql("apply", statements[1])
+        log_sql("apply", ttl_statement)
     try:
-        client.command(statements[1])
+        client.command(ttl_statement)
     except Exception as error:
         log(f"stage=apply status=ttl-failed table={index}/{total} name={name} error={error}")
         raise
@@ -665,6 +1153,71 @@ def apply_execution_plan(
     log(f"stage=apply status=completed tables={total}")
 
 
+def apply_repair_setting_table(
+    client,
+    index: int,
+    total: int,
+    table: Table,
+    cluster: str | None,
+    log_query: bool,
+) -> int:
+    name = f"{table.database}.{table.name}"
+    statement = render_repair_setting_alter(table, cluster)
+    log(f"stage=apply_repair status=started table={index}/{total} name={name}")
+    if log_query:
+        log_sql("apply_repair", statement)
+    try:
+        client.command(statement)
+    except Exception as error:
+        log(f"stage=apply_repair status=failed table={index}/{total} name={name} error={error}")
+        raise
+    log(f"stage=apply_repair status=completed table={index}/{total} name={name}")
+    return index
+
+
+def apply_repair_setting_with_thread_client(
+    args: argparse.Namespace,
+    index: int,
+    total: int,
+    table: Table,
+    log_query: bool,
+) -> int:
+    return apply_repair_setting_table(
+        get_apply_client(args), index, total, table, args.cluster, log_query
+    )
+
+
+def apply_repair_settings(client, args: argparse.Namespace, tables: list[Table]) -> None:
+    total = len(tables)
+    log(f"stage=apply_repair status=started tables={total} concurrency={args.apply_concurrency}")
+    if args.apply_concurrency == 1:
+        for index, table in enumerate(tables, start=1):
+            apply_repair_setting_table(
+                client, index, total, table, args.cluster, index <= SUMMARY_TABLE_LIMIT
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=args.apply_concurrency) as executor:
+            futures = [
+                executor.submit(
+                    apply_repair_setting_with_thread_client,
+                    args,
+                    index,
+                    total,
+                    table,
+                    index <= SUMMARY_TABLE_LIMIT,
+                )
+                for index, table in enumerate(tables, start=1)
+            ]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+    log(f"stage=apply_repair status=completed tables={total}")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -691,13 +1244,43 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"Maximum tables to ALTER concurrently; default: {DEFAULT_APPLY_CONCURRENCY}",
     )
     parser.add_argument(
-        "--no-materialize-ttl-after-modify",
+        "--materialize-ttl-after-modify",
         dest="materialize_ttl_after_modify",
-        action="store_false",
-        default=True,
-        help="Add query SETTINGS materialize_ttl_after_modify = 0 to MODIFY TTL to avoid automatic historical TTL materialization",
+        action="store_true",
+        default=False,
+        help="Enable automatic historical TTL materialization after MODIFY TTL (by default, materialize_ttl_after_modify = 0 is set)",
     )
-    parser.add_argument("--apply", action="store_true", help="Execute the plan; default is dry-run")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--plan",
+        action="store_true",
+        help="Plan TTL RECOMPRESS changes and output SQL without executing (dry-run)",
+    )
+    mode.add_argument("--apply", action="store_true", help="Execute the TTL RECOMPRESS plan")
+    mode.add_argument(
+        "--analysis",
+        action="store_true",
+        help=(
+            "Analyze eligible local disk footprint, separating local-only, local-volume-move, "
+            "and S3/remote-move tables (default mode if no action specified)"
+        ),
+    )
+    mode.add_argument(
+        "--repair-setting",
+        action="store_true",
+        help=(
+            "Analyze tables with TTL RECOMPRESS that do not explicitly enable "
+            "materialize_ttl_recalculate_only, and print the repair SQL"
+        ),
+    )
+    mode.add_argument(
+        "--apply-repair",
+        action="store_true",
+        help=(
+            "Run repair-setting analysis, then enable materialize_ttl_recalculate_only "
+            "on every table that needs repair"
+        ),
+    )
     args = parser.parse_args(argv)
     if ";" in args.codec:
         parser.error("codec must not contain semicolons")
@@ -718,19 +1301,57 @@ def main(argv: list[str]) -> int:
         print("missing dependency: pip install clickhouse-connect", file=sys.stderr)
         return 2
     client = create_client(args)
-    limit_label = "all" if args.all else str(args.limit)
+    if args.repair_setting or args.apply_repair:
+        log(
+            "stage=fetch_repair_setting status=started "
+            f"databases={args.databases or '(all non-system)'} tables={args.tables or '(all)'}"
+        )
+        try:
+            repair_tables = fetch_repair_setting_tables(client, args)
+        except Exception as error:
+            log(f"stage=fetch_repair_setting status=failed error={error}")
+            raise
+        repair_plan = plan_repair_settings(repair_tables)
+        log(
+            "stage=fetch_repair_setting status=completed "
+            f"scanned={len(repair_plan.tables)} recompress={len(repair_plan.recompress_tables)} "
+            f"repair_needed={len(repair_plan.repair_tables)}"
+        )
+        print_repair_setting_analysis(repair_plan, args.cluster)
+        if args.apply_repair:
+            apply_repair_settings(client, args, repair_plan.repair_tables)
+        else:
+            log("stage=apply_repair status=skipped reason=dry-run; rerun with --apply-repair to execute")
+        log(
+            f"run status=completed mode={'apply-repair' if args.apply_repair else 'repair-setting'} "
+            f"repair_needed={len(repair_plan.repair_tables)}"
+        )
+        return 0
+    # Default to analysis mode if no mode is specified
+    if not (args.plan or args.apply or args.analysis):
+        args.analysis = True
+
+    fetch_args = argparse.Namespace(**vars(args))
+    if args.analysis:
+        fetch_args.all = True
+        fetch_args.include_system = True
+    else:
+        fetch_args.include_system = False
+    limit_label = "all" if fetch_args.all else str(fetch_args.limit)
+    database_label = args.databases or ("(all including system)" if args.analysis else "(all non-system)")
     log(
         "stage=fetch status=started "
-        f"limit={limit_label} databases={args.databases or '(all non-system)'} "
+        f"limit={limit_label} databases={database_label} "
         f"tables={args.tables or '(all)'}"
     )
     try:
-        tables = fetch_tables(client, args)
+        tables = fetch_tables(client, fetch_args)
     except Exception as error:
         log(f"stage=fetch status=failed error={error}")
         raise
     log(f"stage=fetch status=completed selected={len(tables)}")
     planned_tables = plan_tables(tables)
+    skipped_summary_plan = collect_skipped_summary_plan(client, fetch_args, planned_tables)
     eligible_tables = [planned.table for planned in planned_tables if planned.reason is None]
     print_table_summary(
         f"Active tables by bytes overall (limit={limit_label} selected={len(tables)} showing={min(len(tables), SUMMARY_TABLE_LIMIT)}):",
@@ -741,6 +1362,18 @@ def main(argv: list[str]) -> int:
         f"(overall_limit={limit_label} selected={len(eligible_tables)} showing={min(len(eligible_tables), SUMMARY_TABLE_LIMIT)}):",
         eligible_tables,
     )
+    if args.analysis:
+        storage_topology = fetch_storage_topology(client)
+        print_analysis(planned_tables, skipped_summary_plan, topology=storage_topology)
+        log("run status=completed mode=analysis")
+        return 0
+
+    # Only continue with plan/apply if --plan or --apply was specified
+    if not (args.plan or args.apply):
+        log("run status=completed mode=analysis")
+        return 0
+
+    print_skipped_table_summary(skipped_summary_plan)
 
     log(f"stage=plan status=started tables={len(tables)}")
     planned = skipped = 0
@@ -778,8 +1411,8 @@ def main(argv: list[str]) -> int:
     if args.apply:
         apply_execution_plan(client, args, execution_plan)
     else:
-        log("stage=apply status=skipped reason=dry-run; rerun with --apply to execute")
-    log(f"run status=completed mode={'apply' if args.apply else 'dry-run'} planned={planned} skipped={skipped}")
+        log("stage=apply status=skipped reason=plan-mode; rerun with --apply to execute")
+    log(f"run status=completed mode={'apply' if args.apply else 'plan'} planned={planned} skipped={skipped}")
     return 0
 
 
