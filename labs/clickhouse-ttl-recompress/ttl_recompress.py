@@ -288,8 +288,8 @@ def extract_column_types(create_query: str) -> dict[str, str]:
 
     columns: dict[str, str] = {}
     body = create_query[first_open + 1 : close_index]
-    for raw_line in body.splitlines():
-        line = raw_line.strip().rstrip(",")
+    for item in split_top_level_csv(body):
+        line = item.strip()
         if not line:
             continue
         match = re.match(r"`([^`]+)`\s+(.+)$", line) or re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s+(.+)$", line)

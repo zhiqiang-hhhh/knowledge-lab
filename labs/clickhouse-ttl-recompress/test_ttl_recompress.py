@@ -10,6 +10,7 @@ from ttl_recompress import (
     active_materialize_ttl_mutations,
     apply_repair_settings,
     apply_table,
+    extract_column_types,
     extract_ttl,
     fetch_repair_setting_tables,
     fetch_tables,
@@ -271,6 +272,47 @@ class TtlRecompressTest(unittest.TestCase):
     def test_converts_todatetime64_partition_key_to_datetime_for_ttl(self):
         partition_key = "toDateTime64(event_time_ms / 1000, 3)"
         self.assertEqual(ttl_base_expression(partition_key, {}), f"toDateTime({partition_key})")
+
+    def test_extracts_column_types_from_single_line_create_query(self):
+        # ClickHouse system.tables.create_table_query returns a single-line
+        # form with columns separated by top-level commas, not newlines.
+        create_query = (
+            "CREATE TABLE db.t (`id` String, `accountId` String, "
+            "`createTime` DateTime64(3), `modifyTime` DateTime64(3)) "
+            "ENGINE = MergeTree ORDER BY id"
+        )
+        self.assertEqual(
+            extract_column_types(create_query),
+            {
+                "id": "String",
+                "accountId": "String",
+                "createTime": "DateTime64(3)",
+                "modifyTime": "DateTime64(3)",
+            },
+        )
+
+    def test_extracts_column_types_skips_inline_index_definitions(self):
+        create_query = (
+            "CREATE TABLE db.t (`id` String, `createTime` DateTime64(3), "
+            "INDEX idx_id engagementId TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4, "
+            "INDEX idx_bloom engagementId TYPE bloom_filter GRANULARITY 4) "
+            "ENGINE = MergeTree ORDER BY id"
+        )
+        column_types = extract_column_types(create_query)
+        self.assertEqual(column_types.get("createTime"), "DateTime64(3)")
+        self.assertNotIn("INDEX", column_types)
+
+    def test_single_line_create_query_yields_wrapped_datetime64_ttl_base(self):
+        create_query = (
+            "CREATE TABLE db.t (`id` String, `createTime` DateTime64(3)) "
+            "ENGINE = MergeTree PARTITION BY toYYYYMM(createTime) ORDER BY id "
+            "TTL toDateTime(createTime) + toIntervalDay(180)"
+        )
+        column_types = extract_column_types(create_query)
+        self.assertEqual(
+            ttl_base_expression("toYYYYMM(createTime)", column_types),
+            "toDateTime(createTime)",
+        )
 
     def test_skips_tables_without_table_ttl_delete(self):
         table = Table("db", "t", "", "toYYYYMM(time)", 100, 1024)
