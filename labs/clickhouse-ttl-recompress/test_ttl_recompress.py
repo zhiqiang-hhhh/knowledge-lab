@@ -3,11 +3,20 @@ import io
 import unittest
 from contextlib import redirect_stdout
 
+import os
+import tempfile
+
 from ttl_recompress import (
+    ClusterNode,
     PlannedTable,
     StorageTopology,
     Table,
     active_materialize_ttl_mutations,
+    load_clusters_dir,
+    merge_tables,
+    merge_topologies,
+    parse_cluster_file,
+    parse_cluster_node,
     apply_repair_settings,
     apply_table,
     extract_column_types,
@@ -585,6 +594,82 @@ class TtlRecompressTest(unittest.TestCase):
         self.assertIn("MATERIALIZE TTL", client.query_text)
         self.assertNotIn("database =", client.query_text)
         self.assertNotIn("table =", client.query_text)
+
+
+class ClustersFileTest(unittest.TestCase):
+    def test_parse_cluster_node_variants(self):
+        self.assertEqual(parse_cluster_node("10.0.0.1", 8123), ClusterNode("10.0.0.1", 8123))
+        self.assertEqual(parse_cluster_node("10.0.0.1:9000", 8123), ClusterNode("10.0.0.1", 9000))
+        self.assertEqual(parse_cluster_node("[::1]:9440", 8123), ClusterNode("::1", 9440))
+        self.assertEqual(parse_cluster_node("[fe80::1]", 8123), ClusterNode("fe80::1", 8123))
+        self.assertEqual(parse_cluster_node("host.example.com", None), ClusterNode("host.example.com", None))
+
+    def test_parse_cluster_file(self):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "perf-CH1-arm.txt")
+        with open(path, "w") as handle:
+            handle.write("# arm cluster\n10.21.5.164\n10.21.5.44:9000  # primary\n\n")
+        try:
+            cluster = parse_cluster_file(path, default_port=8123)
+        finally:
+            os.unlink(path)
+            os.rmdir(directory)
+        self.assertEqual(cluster.name, "perf-CH1-arm")
+        self.assertEqual(
+            cluster.nodes,
+            (ClusterNode("10.21.5.164", 8123), ClusterNode("10.21.5.44", 9000)),
+        )
+
+    def test_load_clusters_dir(self):
+        directory = tempfile.mkdtemp()
+        with open(os.path.join(directory, "clusterB.txt"), "w") as handle:
+            handle.write("10.0.1.1\n")
+        with open(os.path.join(directory, "clusterA.txt"), "w") as handle:
+            handle.write("10.0.0.1\n10.0.0.2\n")
+        with open(os.path.join(directory, "empty.txt"), "w") as handle:
+            handle.write("# only a comment\n")
+        with open(os.path.join(directory, "ignored.md"), "w") as handle:
+            handle.write("10.9.9.9\n")
+        try:
+            clusters = load_clusters_dir(directory, default_port=8123)
+        finally:
+            for name in os.listdir(directory):
+                os.unlink(os.path.join(directory, name))
+            os.rmdir(directory)
+        self.assertEqual([c.name for c in clusters], ["clusterA", "clusterB"])  # sorted, empty/.md dropped
+        self.assertEqual(
+            clusters[0].nodes,
+            (ClusterNode("10.0.0.1", 8123), ClusterNode("10.0.0.2", 8123)),
+        )
+
+    def test_load_clusters_dir_requires_a_cluster(self):
+        directory = tempfile.mkdtemp()
+        try:
+            with self.assertRaises(ValueError):
+                load_clusters_dir(directory)
+        finally:
+            os.rmdir(directory)
+
+
+class MergeTablesTest(unittest.TestCase):
+    def _table(self, name, rows, total, local, remote):
+        return Table("db", name, "CREATE TABLE db." + name, "toDate(ts)", rows, total, local, remote, "policy")
+
+    def test_merge_sums_and_sorts(self):
+        node1 = [self._table("a", 10, 100, 60, 40), self._table("b", 5, 50, 50, 0)]
+        node2 = [self._table("a", 20, 200, 100, 100)]
+        merged = merge_tables([node1, node2])
+        self.assertEqual([t.name for t in merged], ["a", "b"])  # sorted by total_bytes desc
+        a = merged[0]
+        self.assertEqual((a.total_rows, a.total_bytes, a.local_bytes, a.remote_bytes), (30, 300, 160, 140))
+
+    def test_merge_topologies_unions(self):
+        topo = merge_topologies([
+            StorageTopology(frozenset({"s3"}), {("p", "v1"): ("d1",)}),
+            StorageTopology(frozenset({"s3b"}), {("p", "v2"): ("d2",)}),
+        ])
+        self.assertEqual(topo.remote_disks, frozenset({"s3", "s3b"}))
+        self.assertEqual(topo.volume_disks, {("p", "v1"): ("d1",), ("p", "v2"): ("d2",)})
 
 
 if __name__ == "__main__":

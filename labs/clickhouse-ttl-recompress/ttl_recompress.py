@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
@@ -447,10 +448,88 @@ def csv_values(value: str | None) -> list[str]:
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
+@dataclass(frozen=True)
+class ClusterNode:
+    host: str
+    port: int | None = None
+
+
+@dataclass(frozen=True)
+class Cluster:
+    name: str
+    nodes: tuple[ClusterNode, ...]
+
+
+def parse_cluster_node(value: str, default_port: int | None) -> ClusterNode:
+    """Parse a ``host`` or ``host:port`` node entry."""
+    value = value.strip()
+    if value.startswith("[") and "]" in value:  # bracketed IPv6, optional :port
+        host, _, rest = value[1:].partition("]")
+        port = rest.lstrip(":")
+        return ClusterNode(host, int(port) if port else default_port)
+    host, sep, port = value.rpartition(":")
+    if sep and port.isdigit():
+        return ClusterNode(host, int(port))
+    return ClusterNode(value, default_port)
+
+
+def parse_cluster_file(path: str, default_port: int | None = None) -> Cluster:
+    """Parse one pssh-style cluster file: one node per line, the file name (without
+    its extension) is the cluster name. Blank lines and ``#`` comments are ignored.
+
+    Example ``perf-CH1-arm.txt``::
+
+        10.21.5.164
+        10.21.5.44
+    """
+    nodes: list[ClusterNode] = []
+    with open(path, encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            nodes.append(parse_cluster_node(line, default_port))
+    name = os.path.splitext(os.path.basename(path))[0]
+    return Cluster(name, tuple(nodes))
+
+
+def load_clusters_dir(path: str, default_port: int | None = None) -> list[Cluster]:
+    """Load clusters from ``path``. If ``path`` is a single file, it is one cluster;
+    otherwise every ``*.txt`` file under the directory is a cluster keyed by file name."""
+    if os.path.isfile(path):
+        cluster = parse_cluster_file(path, default_port)
+        if not cluster.nodes:
+            raise ValueError(f"no nodes found in {path}")
+        return [cluster]
+    entries = sorted(
+        entry.path
+        for entry in os.scandir(path)
+        if entry.is_file() and entry.name.endswith(".txt")
+    )
+    clusters = [
+        cluster
+        for entry in entries
+        if (cluster := parse_cluster_file(entry, default_port)).nodes
+    ]
+    if not clusters:
+        raise ValueError(f"no non-empty *.txt cluster files found in {path}")
+    return clusters
+
+
 def create_client(args: argparse.Namespace):
     return clickhouse_connect.get_client(
         host=args.host,
         port=args.port,
+        username=args.user,
+        password=args.password,
+        secure=args.secure,
+    )
+
+
+def create_node_client(args: argparse.Namespace, node: ClusterNode):
+    return clickhouse_connect.get_client(
+        host=node.host,
+        port=node.port if node.port is not None else args.port,
         username=args.user,
         password=args.password,
         secure=args.secure,
@@ -928,6 +1007,96 @@ def print_analysis(
     print_skipped_table_summary(skipped_summary_plan or planned_tables, limit)
 
 
+def merge_tables(table_lists: list[list[Table]]) -> list[Table]:
+    """Aggregate per-node tables into cluster-level tables by (database, name).
+
+    Row/byte counters are summed across nodes; schema fields (create_query,
+    partition_key, storage_policy) are taken from the first node that reports
+    the table. Results are sorted by total_bytes descending, matching
+    ``fetch_ranked_tables``.
+    """
+    merged: dict[tuple[str, str], Table] = {}
+    for tables in table_lists:
+        for table in tables:
+            key = (table.database, table.name)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = table
+                continue
+            merged[key] = Table(
+                existing.database,
+                existing.name,
+                existing.create_query,
+                existing.partition_key,
+                existing.total_rows + table.total_rows,
+                existing.total_bytes + table.total_bytes,
+                existing.local_bytes + table.local_bytes,
+                existing.remote_bytes + table.remote_bytes,
+                existing.storage_policy,
+            )
+    return sorted(merged.values(), key=lambda table: table.total_bytes, reverse=True)
+
+
+def merge_topologies(topologies: list[StorageTopology]) -> StorageTopology:
+    remote_disks: set[str] = set()
+    volume_disks: dict[tuple[str, str], tuple[str, ...]] = {}
+    for topology in topologies:
+        remote_disks |= set(topology.remote_disks)
+        volume_disks.update(topology.volume_disks)
+    return StorageTopology(frozenset(remote_disks), volume_disks)
+
+
+def run_cluster_analysis(args: argparse.Namespace, cluster: Cluster) -> int:
+    """Fetch tables and storage topology from every node in a cluster and print
+    a single cluster-granularity analysis. Node data is summed per table; note
+    that replicas holding the same data are double-counted, since node topology
+    (shard/replica layout) is not known to this script."""
+    fetch_args = argparse.Namespace(**vars(args))
+    fetch_args.all = True
+    fetch_args.include_system = True
+
+    table_lists: list[list[Table]] = []
+    topologies: list[StorageTopology] = []
+    reachable = 0
+    for index, node in enumerate(cluster.nodes, start=1):
+        endpoint = f"{node.host}:{node.port}" if node.port is not None else node.host
+        log(f"stage=fetch status=started cluster={cluster.name} node={index}/{len(cluster.nodes)} endpoint={endpoint}")
+        try:
+            client = create_node_client(args, node)
+            table_lists.append(fetch_tables(client, fetch_args))
+            topologies.append(fetch_storage_topology(client))
+        except Exception as error:
+            log(f"stage=fetch status=failed cluster={cluster.name} node={endpoint} error={error}")
+            continue
+        reachable += 1
+        log(f"stage=fetch status=completed cluster={cluster.name} node={endpoint} tables={len(table_lists[-1])}")
+
+    print("=" * 72)
+    print(f"Cluster: {cluster.name} (nodes={len(cluster.nodes)} reachable={reachable})")
+    print("=" * 72)
+    if reachable == 0:
+        print("No reachable nodes; skipping analysis.")
+        print()
+        return 1
+
+    tables = merge_tables(table_lists)
+    topology = merge_topologies(topologies)
+    planned_tables = plan_tables(tables)
+    eligible_tables = [planned.table for planned in planned_tables if planned.reason is None]
+    print_table_summary(
+        f"Active tables by bytes overall (selected={len(tables)} showing={min(len(tables), SUMMARY_TABLE_LIMIT)}):",
+        tables,
+    )
+    print_table_summary(
+        "Active tables by bytes excluding skipped tables "
+        f"(selected={len(eligible_tables)} showing={min(len(eligible_tables), SUMMARY_TABLE_LIMIT)}):",
+        eligible_tables,
+    )
+    print_analysis(planned_tables, planned_tables, topology=topology)
+    log(f"run status=completed mode=analysis cluster={cluster.name}")
+    return 0
+
+
 def plan_tables(tables: list[Table]) -> list[PlannedTable]:
     return [
         PlannedTable(table, ttl, ttl_base, skip_reason(table, ttl, ttl_base))
@@ -1228,6 +1397,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--databases", help="Comma-separated database allowlist")
     parser.add_argument("--tables", help="Comma-separated unqualified table-name allowlist")
     parser.add_argument("--cluster", help="Add ON CLUSTER to both ALTER statements")
+    parser.add_argument(
+        "--clusters-dir",
+        dest="clusters_dir",
+        help=(
+            "Path to a pssh-style cluster directory (each *.txt file is a cluster, file "
+            "name = cluster name, one node IP per line) or a single such cluster file. "
+            "Runs --analysis per cluster, aggregating all nodes into one "
+            "cluster-granularity report. Overrides --host."
+        ),
+    )
     parser.add_argument("--codec", default="ZSTD", help="Codec expression inside CODEC(...); default: ZSTD")
     parser.add_argument("--limit", type=int, default=20, help="Maximum largest active tables to process; default: 20")
     parser.add_argument("--all", action="store_true", help="Process all selected active tables instead of only --limit")
@@ -1300,6 +1479,19 @@ def main(argv: list[str]) -> int:
     if clickhouse_connect is None:
         print("missing dependency: pip install clickhouse-connect", file=sys.stderr)
         return 2
+    if args.clusters_dir:
+        try:
+            clusters = load_clusters_dir(args.clusters_dir, default_port=args.port)
+        except (OSError, ValueError) as error:
+            print(f"failed to read clusters dir: {error}", file=sys.stderr)
+            return 2
+        log(f"stage=clusters status=loaded dir={args.clusters_dir} clusters={len(clusters)}")
+        exit_code = 0
+        for cluster in clusters:
+            if run_cluster_analysis(args, cluster) != 0:
+                exit_code = 1
+        log(f"run status=completed mode=clusters clusters={len(clusters)}")
+        return exit_code
     client = create_client(args)
     if args.repair_setting or args.apply_repair:
         log(

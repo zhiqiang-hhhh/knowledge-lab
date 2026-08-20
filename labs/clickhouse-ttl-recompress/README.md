@@ -44,6 +44,19 @@ python3 ttl_recompress.py \
   --cluster production \
   --limit 20 \
   --apply
+
+# 多集群分析：从 pssh 目录逐集群跑 analysis，按集群粒度汇总输出
+python3 ttl_recompress.py \
+  --clusters-dir /Users/roanhe/workspace/pssh-dir/clusters \
+  --databases analytics
+```
+
+`--clusters-dir` 使用 pssh 目录格式：目录下每个 `*.txt` 文件是一个集群，**文件名（去掉 `.txt`）即集群名**，文件内每行一个节点 IP（可选 `:port`，支持 `[ipv6]:port`）；空行和 `#` 注释会被忽略。例如 `perf-CH1-arm.txt`：
+
+```
+10.21.5.164
+10.21.5.44
+10.21.4.244
 ```
 
 **模式说明**：
@@ -77,6 +90,7 @@ ALTER TABLE db.table ON CLUSTER production
 - **修复模式（`--repair-setting`）**：独立的只读修复盘点模式，扫描 `system.tables` 中所有非 system MergeTree 表（包括没有 active part 的空表），再按 `--metadata-batch-size` 分批读取建表语句，以避免大型集群一次读取全量 `create_table_query` 超时。它统计 table-level TTL 含 `RECOMPRESS` 的表、需要修复的表和已经启用 setting 的表，并为需要修复的表打印 `MODIFY SETTING materialize_ttl_recalculate_only = true`。该模式不受 `--limit`/`--all` 影响，但仍支持 `--databases`、`--tables` 和 `--cluster`。
 - **修复执行模式（`--apply-repair`）**：先输出与 `--repair-setting` 相同的统计和 SQL，再执行修复；它只修改 `materialize_ttl_recalculate_only`，不会修改现有 TTL。未显式设置、设置为 `0` 或 `false` 都会被修复，显式设置为 `1` 或 `true` 的表会跳过。修复默认并发度同样为 10，可用 `--apply-concurrency` 调整。
 - `--plan`、`--apply`、`--analysis`、`--repair-setting` 和 `--apply-repair` 是互斥模式。不指定任何模式时默认为 `--analysis`。
+- **多集群分析（`--clusters-dir`）**：读取 pssh 目录（每个 `*.txt` 一个集群，文件名为集群名），忽略 `--host`，按集群名排序依次处理；空文件或非 `.txt` 文件会被忽略。对每个集群依次连接其所有节点，各节点分别执行与 `--analysis` 相同的全量只读盘点（`--all` + 包含 system 库），再按 `(database, table)` 把各节点的行数/bytes（含 local/remote）求和，`storage_policy` 等 schema 字段取首个上报该表的节点，最后输出该集群粒度的单份 analysis 报告，各集群之间用分隔线隔开。节点无法连接时会记录 `stage=fetch status=failed` 并跳过该节点继续，报告头会显示 `nodes`/`reachable` 数量；某集群全部节点不可达时该集群报告为空并使进程以退出码 1 结束。仍支持 `--databases`、`--tables`、`--codec` 等过滤参数。注意：该脚本不感知 shard/replica 拓扑，同一份数据的多个副本会被重复累加，因此汇总的容量应理解为“各节点占用之和”而非去重后的逻辑数据量。
 - `--plan` 和 `--apply` 保持安全默认：只处理非 system 库，并受 `--limit` 限制（默认 20 张表），除非显式传 `--all`。
 - `--analysis` 分别输出 `Top eligible local-only tables`、`Top eligible local-volume-move tables`、`Top eligible S3/remote-move tables`，必要时还会输出 `unresolved-move`；这些表就是全量分析范围内按当前规则可处理的表，并逐表显示 local、remote 和 total bytes。
 - `Top skipped tables by bytes` 会打印最多 20 张跳过的表和 skip reason。普通模式若当前 `--limit` 候选集中不足 20 张 skipped 表，脚本会额外扩大只读扫描范围用于补足 skipped 摘要；这不会改变 `--apply` 实际处理的 eligible 表范围。
